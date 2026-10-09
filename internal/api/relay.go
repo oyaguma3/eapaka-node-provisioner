@@ -15,6 +15,7 @@ import (
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/akaapi"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/store"
 )
 
 // 中継（設計概要 §7）。要求の本文は検証せずにそのまま下流に送り、下流の応答（エラーを含む）をそのまま返す。
@@ -104,7 +105,7 @@ func (h *Handler) relay(w http.ResponseWriter, r *http.Request, name downstream.
 		if r.Method == http.MethodPatch {
 			details["fields"] = fieldNames(req.Body)
 		}
-		h.record(r, audit.action(resp.Status), target, "", details)
+		h.record(r, audit.action(resp.Status), target, "", store.OpCompleted, details)
 	}
 }
 

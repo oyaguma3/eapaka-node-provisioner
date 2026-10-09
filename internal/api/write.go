@@ -17,12 +17,13 @@ import (
 const (
 	// maxBodyBytes は要求の本文の上限（下流と同じ）。
 	maxBodyBytes = 256 << 10
-	// lockTTL は IMSI ごとのロックの有効期限。1 つの操作にかかる最大の時間より長くする（設計概要 §9.1）。
-	lockTTL = 60 * time.Second
+	// LockTTL は IMSI ごとのロックの有効期限。1 つの操作にかかる最大の時間より長くする（設計概要 §9.1）。
+	// 加入者の統合操作（internal/subscriber）も同じ値を使う。
+	LockTTL = 60 * time.Second
 	// idempotencyTTL は、Idempotency-Key の要求の応答を覚えておく時間（設計概要 §9.2）。
 	idempotencyTTL = 24 * time.Hour
 	// idempotencyPendingTTL は、処理中の記録の有効期限。プロセスが落ちても、この時間が過ぎれば同じキーでやり直せる。
-	idempotencyPendingTTL = lockTTL
+	idempotencyPendingTTL = LockTTL
 
 	idempotencyKeyHeader     = "Idempotency-Key"
 	idempotentReplayedHeader = "Idempotent-Replayed"
@@ -166,7 +167,7 @@ func (c *captureWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 // lockIMSI は IMSI のロックを取る。取れなければ応答を書いて false を返す（同じ IMSI の操作が処理中なら 409）。
 // 取れたら、解放する関数を返す。
 func (h *Handler) lockIMSI(w http.ResponseWriter, r *http.Request, imsi string) (unlock func(), ok bool) {
-	token, err := h.Store.AcquireIMSILock(r.Context(), imsi, lockTTL)
+	token, err := h.Store.AcquireIMSILock(r.Context(), imsi, LockTTL)
 	switch {
 	case errors.Is(err, store.ErrLocked):
 		doNotRemember(r)

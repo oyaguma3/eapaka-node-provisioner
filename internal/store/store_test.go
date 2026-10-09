@@ -186,3 +186,58 @@ func TestIdempotency(t *testing.T) {
 		t.Errorf("204 replay: %v, %+v", st, got)
 	}
 }
+
+func TestOperation(t *testing.T) {
+	s := openTestStore(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	op := Operation{
+		ID: "op-1", Kind: "subscriber.update", IMSI: "001010000000001", KeyStore: "poc", Status: OpRunning,
+		Steps: []OperationStep{
+			{Name: "policy.put", Downstream: "prov", State: StepDone},
+			{Name: "subscriber.update", Downstream: "prov", State: StepFailed,
+				Error: &StepError{Status: 503, Cause: "DOWNSTREAM_UNAVAILABLE", Detail: "timeout", Time: now}},
+		},
+		NextAttemptAt: now.Add(time.Minute), Operator: "alice", MgmtClient: "bff", TraceID: "t1",
+		CreatedAt: now, UpdatedAt: now, PrevPolicy: `{"default":"deny","rules":[]}`, HadPolicy: true,
+	}
+	if err := s.SaveOperation(ctx, op, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetOperation(ctx, "op-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != op.Kind || got.IMSI != op.IMSI || got.Status != OpRunning || len(got.Steps) != 2 ||
+		got.Steps[1].Error == nil || got.Steps[1].Error.Status != 503 || !got.Steps[1].Error.Time.Equal(now) ||
+		!got.NextAttemptAt.Equal(op.NextAttemptAt) || !got.CreatedAt.Equal(now) || got.PrevPolicy != op.PrevPolicy || !got.HadPolicy ||
+		got.Operator != "alice" || got.MgmtClient != "bff" || got.TraceID != "t1" || got.Final() {
+		t.Errorf("got = %+v", got)
+	}
+	// 未完了なら ops:active に入り、期限はない。
+	if score, err := s.c.Do(ctx, s.c.B().Zscore().Key(keyActiveOps).Member("op-1").Build()).AsFloat64(); err != nil ||
+		int64(score) != op.NextAttemptAt.UnixMilli() {
+		t.Errorf("active score = %v, %v", score, err)
+	}
+	if ttl, _ := s.c.Do(ctx, s.c.B().Pttl().Key(opKey("op-1")).Build()).AsInt64(); ttl != -1 {
+		t.Errorf("ttl while running = %d", ttl)
+	}
+
+	// 完了したら ops:active から外れ、retention の後に消える。
+	op.Status, op.Attempts = OpRolledBack, 1
+	if err := s.SaveOperation(ctx, op, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.c.Do(ctx, s.c.B().Zcard().Key(keyActiveOps).Build()).AsInt64(); n != 0 {
+		t.Errorf("active after final = %d", n)
+	}
+	if ttl, _ := s.c.Do(ctx, s.c.B().Pttl().Key(opKey("op-1")).Build()).AsInt64(); ttl <= 0 || ttl > time.Hour.Milliseconds() {
+		t.Errorf("ttl after final = %d", ttl)
+	}
+	if got, err := s.GetOperation(ctx, "op-1"); err != nil || got.Status != OpRolledBack || got.Attempts != 1 || !got.Final() {
+		t.Errorf("final = %+v, %v", got, err)
+	}
+	if _, err := s.GetOperation(ctx, "none"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing: %v", err)
+	}
+}

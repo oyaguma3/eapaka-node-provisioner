@@ -207,6 +207,7 @@ type env struct {
 	prov *fakeProv
 	aka  *fakeAka
 	st   *memStore
+	subs *fakeSubs
 	logs *lockedBuffer
 }
 
@@ -245,6 +246,7 @@ func newEnv(t *testing.T, withAka bool) *env {
 			av:             akaapi.AVClient{ID: 2, Name: "vector-gateway", Enabled: true},
 		},
 		st:   newMemStore(),
+		subs: &fakeSubs{},
 		logs: &lockedBuffer{},
 	}
 	h := &Handler{
@@ -253,6 +255,7 @@ func newEnv(t *testing.T, withAka bool) *env {
 		Prov:              e.prov,
 		PLMNMap:           m,
 		Store:             e.st,
+		Subscribers:       e.subs,
 		DownstreamTimeout: time.Second,
 		AuditMaxLen:       1000,
 		Version:           "test",

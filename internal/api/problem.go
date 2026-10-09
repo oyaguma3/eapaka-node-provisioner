@@ -9,9 +9,14 @@ import (
 const (
 	causeInvalidMsgFormat        = "INVALID_MSG_FORMAT"
 	causeInvalidQueryParam       = "INVALID_QUERY_PARAM"
+	causeMandatoryIEMissing      = "MANDATORY_IE_MISSING"
 	causeMandatoryIEIncorrect    = "MANDATORY_IE_INCORRECT"
 	causeOptionalIEIncorrect     = "OPTIONAL_IE_INCORRECT"
 	causeSystemFailure           = "SYSTEM_FAILURE"
+	causeUserNotFound            = "USER_NOT_FOUND"
+	causeSubscriberExists        = "SUBSCRIBER_ALREADY_EXISTS"
+	causeKeyStoreMismatch        = "KEY_STORE_MISMATCH"
+	causeOperationIncomplete     = "OPERATION_INCOMPLETE"
 	causeOperationInProgress     = "OPERATION_IN_PROGRESS"
 	causeIdempotencyKeyMismatch  = "IDEMPOTENCY_KEY_MISMATCH"
 	causeDownstreamError         = "DOWNSTREAM_ERROR"
@@ -38,6 +43,12 @@ type problem struct {
 	DownstreamStatus int `json:"downstreamStatus,omitzero"`
 	// DownstreamCause は下流の cause。
 	DownstreamCause string `json:"downstreamCause,omitempty"`
+	// OperationID は操作の記録の ID（加入者の作成・変更・削除で、下流への書き込みを始めた後に失敗した場合）。
+	OperationID string `json:"operationId,omitempty"`
+	// RolledBack は、補償で元に戻したか（OperationID を返す場合だけ）。
+	RolledBack *bool `json:"rolledBack,omitempty"`
+	// Conflicts は、SUBSCRIBER_ALREADY_EXISTS で同じ IMSI のものがあった場所。
+	Conflicts []string `json:"conflicts,omitempty"`
 }
 
 func newProblem(status int, cause, detail string) *problem {

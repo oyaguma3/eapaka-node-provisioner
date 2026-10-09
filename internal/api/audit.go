@@ -16,7 +16,7 @@ import (
 // record は操作を監査ログに残す（標準出力と Valkey の Stream。設計概要 §10.2）。
 // Valkey への保存に失敗しても操作自体は成功として扱い、エラーをログに残す（標準出力が正本）。
 // details に秘密の値を入れてはならない。
-func (h *Handler) record(r *http.Request, action, target, operationID string, details map[string]any) {
+func (h *Handler) record(r *http.Request, action, target, operationID, result string, details map[string]any) {
 	ctx := r.Context()
 	e := store.AuditEntry{
 		Operator:    downstreamOperator(r),
@@ -25,7 +25,7 @@ func (h *Handler) record(r *http.Request, action, target, operationID string, de
 		Target:      target,
 		TraceID:     trace.From(ctx),
 		OperationID: operationID,
-		Result:      "completed",
+		Result:      result,
 	}
 	if details != nil {
 		b, err := json.Marshal(details, json.Deterministic(true))

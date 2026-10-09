@@ -70,6 +70,8 @@ type Handler struct {
 	AkaAVClientID int64
 	PLMNMap       plmn.Map
 	Store         Store
+	// Subscribers は加入者の統合操作。
+	Subscribers SubscriberService
 	// DownstreamTimeout は、状態の確認で下流を呼ぶときの上限時間。
 	DownstreamTimeout time.Duration
 	// AuditMaxLen は監査ログの保持件数の上限。
@@ -84,6 +86,14 @@ func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+basePath+"/status", h.getStatus)
 	mux.HandleFunc("GET "+basePath+"/audit-logs", h.listAuditLogs)
+
+	// 加入者の統合操作。
+	mux.HandleFunc("GET "+basePath+"/subscribers", h.listSubscribers)
+	mux.HandleFunc("POST "+basePath+"/subscribers", h.idempotent(h.createSubscriber))
+	mux.HandleFunc("GET "+basePath+"/subscribers/{imsi}", h.getSubscriber)
+	mux.HandleFunc("PATCH "+basePath+"/subscribers/{imsi}", h.idempotent(h.updateSubscriber))
+	mux.HandleFunc("DELETE "+basePath+"/subscribers/{imsi}", h.idempotent(h.deleteSubscriber))
+	mux.HandleFunc("GET "+basePath+"/subscribers/{imsi}/keys", h.getSubscriberKeys)
 
 	// 中継（prov）。
 	mux.HandleFunc("GET "+basePath+"/clients", h.relayClients)

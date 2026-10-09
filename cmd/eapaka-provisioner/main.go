@@ -23,10 +23,19 @@ import (
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/server"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/store"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/subscriber"
 )
 
 // version はビルド時に -ldflags "-X main.version=..." で埋め込む。
 var version = "dev"
+
+// 操作の記録とロックの既定値（設計概要 §9）。
+const (
+	// operationRetention は、完了した操作の記録を残す期間。
+	operationRetention = 7 * 24 * time.Hour
+	// retryDelay は、補償・やり直しが失敗したとき、次に試みるまでの時間。
+	retryDelay = 30 * time.Second
+)
 
 const usage = `usage: eapaka-provisioner <command>
 
@@ -140,10 +149,15 @@ func serve(ctx context.Context) error {
 		Version:           version,
 		StartedAt:         time.Now().UTC(),
 	}
+	subs := &subscriber.Service{
+		Prov: prov, AVClientID: cfg.AkaAVClientID, PLMN: cfg.PLMNMap, Store: st, Log: log,
+		LockTTL: api.LockTTL, Retention: operationRetention, RetryDelay: retryDelay,
+	}
 	if aka != nil {
 		// nil の *akaapi.Client をそのまま入れると、nil でないインターフェースになるので分ける。
-		h.Aka = aka
+		h.Aka, subs.Aka = aka, aka
 	}
+	h.Subscribers = subs
 	return server.Run(ctx, server.Options{
 		Addr:           cfg.Addr,
 		GetCertificate: cert.GetCertificate,
