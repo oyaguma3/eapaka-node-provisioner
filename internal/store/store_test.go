@@ -241,3 +241,39 @@ func TestOperation(t *testing.T) {
 		t.Errorf("missing: %v", err)
 	}
 }
+
+func TestDueOperations(t *testing.T) {
+	s := openTestStore(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	save := func(id, status string, next time.Time) {
+		t.Helper()
+		op := Operation{ID: id, Kind: "subscriber.delete", Status: status, NextAttemptAt: next, CreatedAt: now, Steps: []OperationStep{}}
+		if err := s.SaveOperation(ctx, op, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("op-c", OpRetrying, now.Add(-time.Second))
+	save("op-a", OpRunning, now.Add(-time.Minute))
+	save("op-b", OpRetrying, now.Add(time.Minute)) // まだ
+	save("op-d", OpFailed, now.Add(-time.Hour))    // failed は自動では拾わない
+	save("op-e", OpCompleted, now.Add(-time.Hour)) // 完了は入らない
+
+	if ids, err := s.DueOperations(ctx, now, 10); err != nil || !slices.Equal(ids, []string{"op-a", "op-c"}) {
+		t.Errorf("due = %v, %v", ids, err)
+	}
+	if ids, _ := s.DueOperations(ctx, now, 1); !slices.Equal(ids, []string{"op-a"}) {
+		t.Errorf("due limit = %v", ids)
+	}
+	ids, err := s.ActiveOperations(ctx)
+	slices.Sort(ids)
+	if err != nil || !slices.Equal(ids, []string{"op-a", "op-b", "op-c", "op-d"}) {
+		t.Errorf("active = %v, %v", ids, err)
+	}
+	if err := s.RemoveActive(ctx, "op-a"); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := s.DueOperations(ctx, now, 10); !slices.Equal(ids, []string{"op-c"}) {
+		t.Errorf("after remove = %v", ids)
+	}
+}

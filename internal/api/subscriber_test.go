@@ -28,6 +28,12 @@ type fakeSubs struct {
 	actor   subscriber.Actor
 	listArg downstream.ListParams
 	calls   int
+
+	ops       []store.Operation
+	op        store.Operation
+	opArgs    []any
+	counts    [3]int
+	countsErr error
 }
 
 func (f *fakeSubs) Get(context.Context, string) (subscriber.Subscriber, error) { return f.sub, f.err }
@@ -54,6 +60,25 @@ func (f *fakeSubs) Delete(_ context.Context, a subscriber.Actor, _ string) (subs
 	f.calls++
 	f.actor = a
 	return f.res, f.err
+}
+
+func (f *fakeSubs) Operations(_ context.Context, status string, limit int) ([]store.Operation, int, error) {
+	f.opArgs = []any{status, limit}
+	return f.ops, len(f.ops), f.err
+}
+func (f *fakeSubs) Operation(context.Context, string) (store.Operation, error) { return f.op, f.err }
+func (f *fakeSubs) Retry(_ context.Context, a subscriber.Actor, _ string) (store.Operation, error) {
+	f.calls++
+	f.actor = a
+	return f.op, f.err
+}
+func (f *fakeSubs) Dismiss(_ context.Context, a subscriber.Actor, _ string) (store.Operation, error) {
+	f.calls++
+	f.actor = a
+	return f.op, f.err
+}
+func (f *fakeSubs) OperationCounts(context.Context) (map[string]int, error) {
+	return map[string]int{"running": f.counts[0], "retrying": f.counts[1], "failed": f.counts[2]}, f.countsErr
 }
 
 var completedRes = subscriber.Result{OperationID: "op-1", Status: store.OpCompleted, Steps: []store.OperationStep{

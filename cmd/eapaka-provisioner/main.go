@@ -17,6 +17,7 @@ import (
 
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/akaapi"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/api"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/audit"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/certs"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/config"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
@@ -33,8 +34,14 @@ var version = "dev"
 const (
 	// operationRetention は、完了した操作の記録を残す期間。
 	operationRetention = 7 * 24 * time.Hour
-	// retryDelay は、補償・やり直しが失敗したとき、次に試みるまでの時間。
+	// retryDelay は、補償・やり直しが失敗したとき、次に試みるまでの時間。失敗するたびに倍にする。
 	retryDelay = 30 * time.Second
+	// maxRetryDelay は、次に試みるまでの時間の上限。
+	maxRetryDelay = 10 * time.Minute
+	// giveUpAfter は、自動のやり直しをやめて failed にするまでの時間（操作の作成から。手でやり直すと延びる）。
+	giveUpAfter = 24 * time.Hour
+	// workerInterval は、ワーカーが未完了の操作を見る間隔。
+	workerInterval = 30 * time.Second
 )
 
 const usage = `usage: eapaka-provisioner <command>
@@ -137,6 +144,7 @@ func serve(ctx context.Context) error {
 	}
 	cancel()
 
+	auditRec := &audit.Recorder{Log: log, Store: st, MaxLen: cfg.AuditMaxLen}
 	h := &api.Handler{
 		Log:               log,
 		MgmtClient:        func(r *http.Request) string { return server.AdminClientName(r, cfg.AdminClients) },
@@ -145,19 +153,22 @@ func serve(ctx context.Context) error {
 		PLMNMap:           cfg.PLMNMap,
 		Store:             st,
 		DownstreamTimeout: cfg.DownstreamTimeout,
-		AuditMaxLen:       cfg.AuditMaxLen,
+		Audit:             auditRec,
 		Version:           version,
 		StartedAt:         time.Now().UTC(),
 	}
 	subs := &subscriber.Service{
-		Prov: prov, AVClientID: cfg.AkaAVClientID, PLMN: cfg.PLMNMap, Store: st, Log: log,
-		LockTTL: api.LockTTL, Retention: operationRetention, RetryDelay: retryDelay,
+		Prov: prov, AVClientID: cfg.AkaAVClientID, PLMN: cfg.PLMNMap, Store: st, Log: log, Audit: auditRec,
+		LockTTL: api.LockTTL, Retention: operationRetention,
+		RetryDelay: retryDelay, MaxRetryDelay: maxRetryDelay, GiveUpAfter: giveUpAfter,
 	}
 	if aka != nil {
 		// nil の *akaapi.Client をそのまま入れると、nil でないインターフェースになるので分ける。
 		h.Aka, subs.Aka = aka, aka
 	}
 	h.Subscribers = subs
+	// やり直しのワーカー。要求が落ちた操作と、補償・やり直しが失敗した操作を続ける（設計概要 §9.3）。
+	go subs.RunWorker(ctx, workerInterval)
 	return server.Run(ctx, server.Options{
 		Addr:           cfg.Addr,
 		GetCertificate: cert.GetCertificate,

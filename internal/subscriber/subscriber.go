@@ -52,6 +52,15 @@ type Store interface {
 	AcquireIMSILock(ctx context.Context, imsi string, ttl time.Duration) (token string, err error)
 	ReleaseIMSILock(ctx context.Context, imsi, token string) error
 	SaveOperation(ctx context.Context, op store.Operation, retention time.Duration) error
+	GetOperation(ctx context.Context, id string) (store.Operation, error)
+	DueOperations(ctx context.Context, now time.Time, limit int) ([]string, error)
+	ActiveOperations(ctx context.Context) ([]string, error)
+	RemoveActive(ctx context.Context, id string) error
+}
+
+// Auditor は監査ログを残す。*audit.Recorder が満たす。
+type Auditor interface {
+	Record(ctx context.Context, e store.AuditEntry)
 }
 
 // Service は加入者の統合操作。
@@ -69,8 +78,14 @@ type Service struct {
 	LockTTL time.Duration
 	// Retention は、完了した操作の記録を残す期間。
 	Retention time.Duration
-	// RetryDelay は、補償・やり直しが失敗したとき、次に試みるまでの時間。
+	// RetryDelay は、補償・やり直しが失敗したとき、次に試みるまでの時間。失敗するたびに倍にする。
 	RetryDelay time.Duration
+	// MaxRetryDelay は、次に試みるまでの時間の上限。
+	MaxRetryDelay time.Duration
+	// GiveUpAfter は、操作の作成からこの時間を過ぎても終わらなければ、自動のやり直しをやめて failed にする時間。
+	GiveUpAfter time.Duration
+	// Audit は、ワーカーと操作の記録への操作の監査ログを残す。nil なら残さない。
+	Audit Auditor
 	// Now は現在時刻（テストで差し替える）。nil なら time.Now。
 	Now func() time.Time
 }

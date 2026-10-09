@@ -11,6 +11,7 @@ import (
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/plmn"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/store"
 )
 
 type statusJSON struct {
@@ -58,9 +59,9 @@ type valkeyStatusJSON struct {
 }
 
 type operationCountsJSON struct {
-	Running  int64 `json:"running"`
-	Retrying int64 `json:"retrying"`
-	Failed   int64 `json:"failed"`
+	Running  int `json:"running"`
+	Retrying int `json:"retrying"`
+	Failed   int `json:"failed"`
 }
 
 // getStatus は provisioner と下流の状態を返す。下流や Valkey に接続できなくても 200 を返し、項目ごとに示す。
@@ -82,8 +83,12 @@ func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out.Valkey.Reachable = true
-		// 操作の記録（設計概要 §9.3）を実装するまでは、未解決の操作はない。
-		out.Operations = &operationCountsJSON{}
+		counts, err := h.Subscribers.OperationCounts(ctx)
+		if err != nil {
+			h.Log.ErrorContext(ctx, "count operations", "error", err)
+			return
+		}
+		out.Operations = &operationCountsJSON{Running: counts[store.OpRunning], Retrying: counts[store.OpRetrying], Failed: counts[store.OpFailed]}
 	})
 	wg.Wait()
 	writeJSON(w, http.StatusOK, out)

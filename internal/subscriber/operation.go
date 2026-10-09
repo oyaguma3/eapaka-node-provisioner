@@ -92,6 +92,7 @@ func (s *Service) newRun(ctx context.Context, a Actor, kind, imsi string, ks plm
 		ID: uuid.NewV7().String(), Kind: kind, IMSI: imsi, KeyStore: string(ks), Status: store.OpRunning,
 		// 実行中の操作は、ロックの有効期限を過ぎたら要求が落ちたとみなされる（設計概要 §9.3）。
 		NextAttemptAt: now.Add(s.LockTTL),
+		GiveUpAt:      giveUpAt(now, s.GiveUpAfter),
 		Operator:      a.Operator, MgmtClient: a.MgmtClient, TraceID: a.TraceID, CreatedAt: now,
 	}
 	for _, sp := range steps {
@@ -232,6 +233,34 @@ func (s *Service) exec(ctx context.Context, op *store.Operation, name string, ds
 // rollback は、作成・変更が要求の中で失敗したときに補償する。cause は最初の失敗。
 func (r *run) rollback(cause error) (Subscriber, Result, error) {
 	r.skipPending()
+	r.plan()
+	ok := r.compensate()
+	r.finish(ok)
+	if err := r.save(); err != nil {
+		r.s.Log.ErrorContext(r.ctx, "save operation", "operation_id", r.op.ID, "error", err)
+	}
+	if !ok {
+		r.s.Log.ErrorContext(r.ctx, "compensation failed; will retry", "operation_id", r.op.ID, "imsi", r.op.IMSI, "kind", r.op.Kind)
+	}
+	return Subscriber{}, r.result(), &OperationError{OperationID: r.op.ID, RolledBack: ok, Incomplete: !ok, Err: cause}
+}
+
+// hasRecoverySteps は、補償の手順を既に計画したかを返す。
+func (r *run) hasRecoverySteps() bool {
+	for _, st := range r.op.Steps {
+		if st.Name == stepSubscriberCompensate || st.Name == stepPolicyRestore || (r.op.Kind == KindCreate && st.Name == stepPolicyDelete) {
+			return true
+		}
+	}
+	return false
+}
+
+// plan は、作成・変更の補償の手順を計画して加える（既に計画してあれば何もしない）。
+// まだ行っていない（pending の）手順は、反映された可能性があるものとして扱う（要求の中では先に skipPending する）。
+func (r *run) plan() {
+	if r.hasRecoverySteps() {
+		return
+	}
 	switch r.op.Kind {
 	case KindCreate:
 		// 作成は、反映された可能性のあるものを消す（ポリシー、加入者の順）。存在確認で、どちらもなかったことを確かめてある。
@@ -247,25 +276,46 @@ func (r *run) rollback(cause error) (Subscriber, Result, error) {
 			r.add(stepPolicyRestore, downstream.Prov)
 		}
 	}
-	ok := r.compensate()
-	if ok {
-		r.op.Status = store.OpRolledBack
-		for i := range r.op.Steps {
-			if r.op.Steps[i].State == store.StepDone && !isRecoveryStep(r.op.Kind, r.op.Steps[i].Name) {
-				r.op.Steps[i].State = store.StepCompensated
-			}
-		}
-	} else {
-		r.op.Status = store.OpRetrying
-		r.op.NextAttemptAt = r.s.now().Add(r.s.RetryDelay)
-	}
-	if err := r.save(); err != nil {
-		r.s.Log.ErrorContext(r.ctx, "save operation", "operation_id", r.op.ID, "error", err)
-	}
+}
+
+// finish は、補償・やり直しの結果から操作の状態を決める。ok なら完了（作成・変更は rolled_back、削除は completed）、
+// そうでなければ retrying にして、次に試みる時刻を決める。
+func (r *run) finish(ok bool) {
 	if !ok {
-		r.s.Log.ErrorContext(r.ctx, "compensation failed; will retry", "operation_id", r.op.ID, "imsi", r.op.IMSI, "kind", r.op.Kind)
+		r.op.Status = store.OpRetrying
+		r.op.NextAttemptAt = r.s.now().Add(r.s.retryDelay(r.op.Attempts))
+		return
 	}
-	return Subscriber{}, r.result(), &OperationError{OperationID: r.op.ID, RolledBack: ok, Incomplete: !ok, Err: cause}
+	if r.op.Kind == KindDelete {
+		r.op.Status = store.OpCompleted
+		return
+	}
+	r.op.Status = store.OpRolledBack
+	for i := range r.op.Steps {
+		if r.op.Steps[i].State == store.StepDone && !isRecoveryStep(r.op.Kind, r.op.Steps[i].Name) {
+			r.op.Steps[i].State = store.StepCompensated
+		}
+	}
+}
+
+// giveUpAt は、now から after 後の時刻（after が 0 なら、やめない＝ゼロ値）。
+func giveUpAt(now time.Time, after time.Duration) time.Time {
+	if after <= 0 {
+		return time.Time{}
+	}
+	return now.Add(after)
+}
+
+// retryDelay は、attempts 回試みた後に次に試みるまでの時間（RetryDelay から倍にして、MaxRetryDelay まで）。
+func (s *Service) retryDelay(attempts int) time.Duration {
+	d := s.RetryDelay
+	for range attempts {
+		d *= 2
+		if s.MaxRetryDelay > 0 && d >= s.MaxRetryDelay {
+			return s.MaxRetryDelay
+		}
+	}
+	return d
 }
 
 // lock は IMSI のロックを取る。取れなければ store.ErrLocked。
@@ -444,9 +494,13 @@ func (s *Service) Update(ctx context.Context, a Actor, imsi string, in UpdateInp
 	r.op.Status = store.OpCompleted
 	if err := r.save(); err != nil {
 		if in.HasKey() {
-			// 鍵の変更は戻せないので、変更は終わったものとして返す（記録は実行中のまま残り、後でポリシーが
-			// 変更前に戻されないよう、ここでは補償しない）。
-			r.s.Log.ErrorContext(ctx, "save operation", "operation_id", r.op.ID, "error", err)
+			// 鍵の変更は戻せないので、補償せずに変更は終わったものとして返す。記録はもう 1 回だけ書き直し、
+			// それでも書けなければ実行中のまま残る（ワーカーは鍵が変わったかどうか分からないものとして failed にし、
+			// 手での確認を待つ。設計概要 §9.3）。
+			if err := r.save(); err != nil {
+				r.s.Log.ErrorContext(ctx, "save operation after key update; manual check will be required",
+					"operation_id", r.op.ID, "imsi", imsi, "error", err)
+			}
 			return s.view(imsi, st), r.result(), nil
 		}
 		r.op.Status = store.OpRunning
@@ -499,8 +553,7 @@ func (s *Service) Delete(ctx context.Context, a Actor, imsi string) (Result, err
 		return Result{}, err
 	}
 	if !r.compensate() {
-		r.op.Status = store.OpRetrying
-		r.op.NextAttemptAt = s.now().Add(s.RetryDelay)
+		r.finish(false)
 		r.saveLogged()
 		s.Log.ErrorContext(ctx, "delete failed; will retry", "operation_id", r.op.ID, "imsi", imsi)
 		var cause error = errors.New("delete failed")
@@ -511,7 +564,7 @@ func (s *Service) Delete(ctx context.Context, a Actor, imsi string) (Result, err
 		}
 		return r.result(), &OperationError{OperationID: r.op.ID, Incomplete: true, Err: cause}
 	}
-	r.op.Status = store.OpCompleted
+	r.finish(true)
 	// 「完了」を残せなくても、削除は済んでいる（後でやり直されても、既にないものの削除は成功になる）。
 	r.saveLogged()
 	return r.result(), nil

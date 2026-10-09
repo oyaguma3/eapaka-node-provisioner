@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"net/http"
@@ -13,9 +12,7 @@ import (
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/trace"
 )
 
-// record は操作を監査ログに残す（標準出力と Valkey の Stream。設計概要 §10.2）。
-// Valkey への保存に失敗しても操作自体は成功として扱い、エラーをログに残す（標準出力が正本）。
-// details に秘密の値を入れてはならない。
+// record は操作を監査ログに残す（設計概要 §10.2）。details に秘密の値を入れてはならない。
 func (h *Handler) record(r *http.Request, action, target, operationID, result string, details map[string]any) {
 	ctx := r.Context()
 	e := store.AuditEntry{
@@ -34,14 +31,7 @@ func (h *Handler) record(r *http.Request, action, target, operationID, result st
 		}
 		e.Details = string(b)
 	}
-	h.Log.InfoContext(ctx, "audit", "trace_id", e.TraceID, "operator", e.Operator, "mgmt_client", e.MgmtClient,
-		"action", action, "target", target, "operation_id", operationID, "result", e.Result, "details", e.Details)
-	// 要求が途中で切れても記録は残す。
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
-	defer cancel()
-	if err := h.Store.AppendAudit(sctx, e, h.AuditMaxLen); err != nil {
-		h.Log.ErrorContext(sctx, "append audit", "action", action, "target", target, "error", err)
-	}
+	h.Audit.Record(ctx, e)
 }
 
 // downstreamOperator は要求の X-Operator-Id（checkOperator で形式を確かめた値。省略なら空文字列）。

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/akaapi"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/audit"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/plmn"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
@@ -46,7 +47,6 @@ type AkaAPI interface {
 type Store interface {
 	Ping(ctx context.Context) error
 
-	AppendAudit(ctx context.Context, e store.AuditEntry, maxLen int64) error
 	ListAudit(ctx context.Context, before string, limit int) ([]store.AuditEntry, string, error)
 
 	AcquireIMSILock(ctx context.Context, imsi string, ttl time.Duration) (token string, err error)
@@ -74,8 +74,8 @@ type Handler struct {
 	Subscribers SubscriberService
 	// DownstreamTimeout は、状態の確認で下流を呼ぶときの上限時間。
 	DownstreamTimeout time.Duration
-	// AuditMaxLen は監査ログの保持件数の上限。
-	AuditMaxLen int64
+	// Audit は監査ログを残す。
+	Audit *audit.Recorder
 
 	Version   string
 	StartedAt time.Time
@@ -94,6 +94,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("PATCH "+basePath+"/subscribers/{imsi}", h.idempotent(h.updateSubscriber))
 	mux.HandleFunc("DELETE "+basePath+"/subscribers/{imsi}", h.idempotent(h.deleteSubscriber))
 	mux.HandleFunc("GET "+basePath+"/subscribers/{imsi}/keys", h.getSubscriberKeys)
+
+	// 操作の記録。
+	mux.HandleFunc("GET "+basePath+"/operations", h.listOperations)
+	mux.HandleFunc("GET "+basePath+"/operations/{operationId}", h.getOperation)
+	mux.HandleFunc("POST "+basePath+"/operations/{operationId}/retry", h.idempotent(h.retryOperation))
+	mux.HandleFunc("POST "+basePath+"/operations/{operationId}/dismiss", h.idempotent(h.dismissOperation))
 
 	// 中継（prov）。
 	mux.HandleFunc("GET "+basePath+"/clients", h.relayClients)

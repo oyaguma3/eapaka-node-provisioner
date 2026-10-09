@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -70,11 +71,13 @@ type Operation struct {
 	Attempts int
 	// NextAttemptAt は次に処理してよい時刻。実行中の操作では、要求が落ちたとみなす時刻（ロックの有効期限）。
 	NextAttemptAt time.Time
-	Operator      string
-	MgmtClient    string
-	TraceID       string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// GiveUpAt は、これを過ぎても終わらなければ自動のやり直しをやめて failed にする時刻（手でやり直すと延びる）。
+	GiveUpAt   time.Time
+	Operator   string
+	MgmtClient string
+	TraceID    string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 	// PrevPolicy は、変更の補償に使う変更前の認可ポリシー（JSON）。HadPolicy が false なら変更前はなかった。
 	PrevPolicy string
 	HadPolicy  bool
@@ -107,6 +110,7 @@ func (s *Store) SaveOperation(ctx context.Context, op Operation, retention time.
 			FieldValue("steps", string(steps)).
 			FieldValue("attempts", strconv.Itoa(op.Attempts)).
 			FieldValue("next_attempt_at", formatMilli(op.NextAttemptAt)).
+			FieldValue("give_up_at", formatMilli(op.GiveUpAt)).
 			FieldValue("operator", op.Operator).
 			FieldValue("mgmt_client", op.MgmtClient).
 			FieldValue("trace_id", op.TraceID).
@@ -120,8 +124,13 @@ func (s *Store) SaveOperation(ctx context.Context, op Operation, retention time.
 			s.c.B().Zrem().Key(keyActiveOps).Member(op.ID).Build(),
 			s.c.B().Pexpire().Key(key).Milliseconds(retention.Milliseconds()).Build())
 	} else {
+		// failed は自動では処理しない（手での対応を待つ）ので、期限の来ない +inf にする。
+		score := float64(op.NextAttemptAt.UnixMilli())
+		if op.Status == OpFailed {
+			score = math.Inf(1)
+		}
 		cmds = append(cmds,
-			s.c.B().Zadd().Key(keyActiveOps).ScoreMember().ScoreMember(float64(op.NextAttemptAt.UnixMilli()), op.ID).Build(),
+			s.c.B().Zadd().Key(keyActiveOps).ScoreMember().ScoreMember(score, op.ID).Build(),
 			s.c.B().Persist().Key(key).Build())
 	}
 	cmds = append(cmds, s.c.B().Exec().Build())
@@ -145,6 +154,7 @@ func (s *Store) GetOperation(ctx context.Context, id string) (Operation, error) 
 	op := Operation{
 		ID: id, Kind: m["kind"], IMSI: m["imsi"], KeyStore: m["key_store"], Status: m["status"],
 		NextAttemptAt: parseMilli(m["next_attempt_at"]),
+		GiveUpAt:      parseMilli(m["give_up_at"]),
 		Operator:      m["operator"], MgmtClient: m["mgmt_client"], TraceID: m["trace_id"],
 		CreatedAt: parseMilli(m["created_at"]), UpdatedAt: parseMilli(m["updated_at"]),
 		PrevPolicy: m["prev_policy"], HadPolicy: m["had_policy"] == "1",
@@ -154,6 +164,33 @@ func (s *Store) GetOperation(ctx context.Context, id string) (Operation, error) 
 		return Operation{}, fmt.Errorf("get operation %s: steps: %w", id, err)
 	}
 	return op, nil
+}
+
+// DueOperations は、処理してよい時刻が now 以前の未完了の操作の ID を、時刻の古い順に limit 件まで返す（ワーカーが使う）。
+func (s *Store) DueOperations(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	ids, err := s.c.Do(ctx, s.c.B().Zrange().Key(keyActiveOps).Min("-inf").Max(strconv.FormatInt(now.UnixMilli(), 10)).
+		Byscore().Limit(0, int64(limit)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("due operations: %w", err)
+	}
+	return ids, nil
+}
+
+// ActiveOperations は未完了（running / retrying / failed）の操作の ID を全て返す。
+func (s *Store) ActiveOperations(ctx context.Context) ([]string, error) {
+	ids, err := s.c.Do(ctx, s.c.B().Zrange().Key(keyActiveOps).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("active operations: %w", err)
+	}
+	return ids, nil
+}
+
+// RemoveActive は ops:active から ID を外す（記録が消えていた場合の後始末）。
+func (s *Store) RemoveActive(ctx context.Context, id string) error {
+	if err := s.c.Do(ctx, s.c.B().Zrem().Key(keyActiveOps).Member(id).Build()).Error(); err != nil {
+		return fmt.Errorf("remove active operation %s: %w", id, err)
+	}
+	return nil
 }
 
 func formatMilli(t time.Time) string {

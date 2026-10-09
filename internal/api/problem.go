@@ -17,6 +17,8 @@ const (
 	causeSubscriberExists        = "SUBSCRIBER_ALREADY_EXISTS"
 	causeKeyStoreMismatch        = "KEY_STORE_MISMATCH"
 	causeOperationIncomplete     = "OPERATION_INCOMPLETE"
+	causeOperationNotFound       = "OPERATION_NOT_FOUND"
+	causeOperationStateConflict  = "OPERATION_STATE_CONFLICT"
 	causeOperationInProgress     = "OPERATION_IN_PROGRESS"
 	causeIdempotencyKeyMismatch  = "IDEMPOTENCY_KEY_MISMATCH"
 	causeDownstreamError         = "DOWNSTREAM_ERROR"

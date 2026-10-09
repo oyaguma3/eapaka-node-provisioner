@@ -27,6 +27,12 @@ type SubscriberService interface {
 	Create(ctx context.Context, a subscriber.Actor, in subscriber.CreateInput) (subscriber.Subscriber, subscriber.Result, error)
 	Update(ctx context.Context, a subscriber.Actor, imsi string, in subscriber.UpdateInput) (subscriber.Subscriber, subscriber.Result, error)
 	Delete(ctx context.Context, a subscriber.Actor, imsi string) (subscriber.Result, error)
+
+	Operations(ctx context.Context, status string, limit int) ([]store.Operation, int, error)
+	Operation(ctx context.Context, id string) (store.Operation, error)
+	Retry(ctx context.Context, a subscriber.Actor, id string) (store.Operation, error)
+	Dismiss(ctx context.Context, a subscriber.Actor, id string) (store.Operation, error)
+	OperationCounts(ctx context.Context) (map[string]int, error)
 }
 
 // ---- 応答の形 ----

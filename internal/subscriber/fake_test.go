@@ -381,6 +381,76 @@ func (m *memStore) SaveOperation(_ context.Context, op store.Operation, _ time.D
 	return nil
 }
 
+func (m *memStore) GetOperation(_ context.Context, id string) (store.Operation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	op, ok := m.ops[id]
+	if !ok {
+		return store.Operation{}, store.ErrNotFound
+	}
+	op.Steps = slices.Clone(op.Steps)
+	return op, nil
+}
+
+// active は ops:active に入る（未完了の）操作か。
+func active(op store.Operation) bool { return !op.Final() }
+
+func (m *memStore) DueOperations(_ context.Context, now time.Time, limit int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var due []store.Operation
+	for _, op := range m.ops {
+		if active(op) && op.Status != store.OpFailed && !op.NextAttemptAt.After(now) {
+			due = append(due, op)
+		}
+	}
+	slices.SortFunc(due, func(a, b store.Operation) int { return a.NextAttemptAt.Compare(b.NextAttemptAt) })
+	var ids []string
+	for _, op := range due[:min(limit, len(due))] {
+		ids = append(ids, op.ID)
+	}
+	return ids, nil
+}
+
+func (m *memStore) ActiveOperations(context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ids []string
+	for id, op := range m.ops {
+		if active(op) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+func (m *memStore) RemoveActive(context.Context, string) error { return nil }
+
+// put は操作の記録を直接置く（テストの準備）。
+func (m *memStore) put(op store.Operation) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ops[op.ID] = op
+}
+
+// memAudit は監査ログの偽物。
+type memAudit struct {
+	mu      sync.Mutex
+	entries []store.AuditEntry
+}
+
+func (a *memAudit) Record(_ context.Context, e store.AuditEntry) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.entries = append(a.entries, e)
+}
+
+func (a *memAudit) list() []store.AuditEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.entries)
+}
+
 func (m *memStore) op(id string) store.Operation {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -390,10 +460,13 @@ func (m *memStore) op(id string) store.Operation {
 // ---- テスト環境 ----
 
 type env struct {
-	s    *Service
-	prov *fakeProv
-	aka  *fakeAka
-	st   *memStore
+	s     *Service
+	prov  *fakeProv
+	aka   *fakeAka
+	st    *memStore
+	audit *memAudit
+	// now は Service の現在時刻（進められる）。
+	now time.Time
 }
 
 // PLMN マップ: 00102 は aka、それ以外は poc。vector-gateway の AVクライアントID は 1。
@@ -408,12 +481,14 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{prov: newFakeProv(), aka: newFakeAka(), st: newMemStore()}
+	e := &env{prov: newFakeProv(), aka: newFakeAka(), st: newMemStore(), audit: &memAudit{},
+		now: time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)}
 	e.s = &Service{
-		Prov: e.prov, Aka: e.aka, AVClientID: 1, PLMN: m, Store: e.st,
+		Prov: e.prov, Aka: e.aka, AVClientID: 1, PLMN: m, Store: e.st, Audit: e.audit,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		LockTTL: time.Minute, Retention: time.Hour, RetryDelay: 30 * time.Second,
-		Now: func() time.Time { return time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC) },
+		MaxRetryDelay: 10 * time.Minute, GiveUpAfter: 24 * time.Hour,
+		Now: func() time.Time { return e.now },
 	}
 	return e
 }

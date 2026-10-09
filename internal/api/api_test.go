@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/akaapi"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/audit"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/plmn"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
@@ -257,10 +258,10 @@ func newEnv(t *testing.T, withAka bool) *env {
 		Store:             e.st,
 		Subscribers:       e.subs,
 		DownstreamTimeout: time.Second,
-		AuditMaxLen:       1000,
 		Version:           "test",
 		StartedAt:         time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC),
 	}
+	h.Audit = &audit.Recorder{Log: h.Log, Store: e.st, MaxLen: 1000}
 	if withAka {
 		h.Aka, h.AkaAVClientID = e.aka, 2
 	}

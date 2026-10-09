@@ -436,7 +436,8 @@ paths:
       operationId: retryOperation
       description: |
         状態が `failed` の操作の続き（作成・変更は補償、削除は残りの削除）を、その場で 1 回行う。
-        成功すれば `rolled_back`（作成・変更）または `completed`（削除）になり、失敗すれば `retrying` に戻って自動のやり直しを再開する。
+        成功すれば `rolled_back`（作成・変更）または `completed`（削除）になり、失敗すれば `retrying` に戻って自動のやり直しを再開する
+        （自動のやり直しをやめるまでの 24 時間を、今から数え直す）。
         本文は送らない。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1006,7 +1007,9 @@ components:
     OperationStateConflict:
       description: |
         操作の状態がその処理を受け付けない（`retry` は `failed` だけ、`dismiss` は `retrying` / `failed` だけ）。
-        `cause` は `OPERATION_STATE_CONFLICT`。処理中なら `OPERATION_IN_PROGRESS`。
+        鍵の変更が反映されたかどうか分からない変更（実行中のまま残り、ワーカーが `failed` にしたもの）は `retry` できない
+        （下流の状態を確かめて直した後に `dismiss` する）。
+        `cause` は `OPERATION_STATE_CONFLICT`。同じ IMSI の操作が処理中なら `OPERATION_IN_PROGRESS`。
       content:
         application/problem+json:
           schema:
