@@ -198,7 +198,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 ### 10.2 操作者・トレースID・監査ログ
 
 - `X-Operator-Id`（`^[A-Za-z0-9._@-]{1,64}$`）を受け取り、そのまま下流 2 つに渡す。下流の監査ログには「操作者＝BFF の利用者、`mgmt_client`＝provisioner」が残る。
-- `X-Trace-ID`（印字可能 ASCII 1〜64 文字）を受け取るか採番し（16 バイトの乱数の 16 進 32 桁）、同じ値を下流 2 つに渡して応答のヘッダーでも返す。prov はログと監査ログに記録する。aka-only-server の管理API は現状 `X-Trace-ID` を記録しない（§15 の 1）。
+- `X-Trace-ID`（印字可能 ASCII 1〜64 文字）を受け取るか採番し（16 バイトの乱数の 16 進 32 桁）、同じ値を下流 2 つに渡して応答のヘッダーでも返す。prov と aka（管理API 0.2.0 以降）は、ログと監査ログに記録する（§15 の 1）。
 - provisioner の監査ログは、標準出力（JSON）に出し、あわせて Valkey の Stream `audit` に保存する（上限 `PROVISIONER_AUDIT_MAX`、既定 10000）。保存に失敗しても操作は成功として扱い、ERROR のログを出す（prov と同じ）。
 - 監査ログの項目: `id`、`time`、`operator`、`mgmtClient`、`action`、`target`、`traceId`、`operationId`、`result`（`completed` / `rolled_back` / `retrying` / `failed`）、`details`（下流ごとの結果。秘密の値は含まない）。`action` は下流と同じ命名（`subscriber.create` 等）に、`operation.retry` / `operation.dismiss` を加える。
 - 秘密の値の取得（`/subscribers/{imsi}/keys`、`/clients/{clientId}/secret`）も、そのたびに監査ログに残す（値は残さない）。
@@ -271,7 +271,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 
 | # | 内容 | 決定 |
 |---|---|---|
-| 1 | aka-only-server の管理API は `X-Trace-ID` を受け取らず、監査ログにも残さない（2026-10-10 に確認）。provisioner の操作と aka の監査ログを突き合わせる手がかりが、操作者と時刻だけになる | aka-only-server の管理API に、prov と同じ作法の `X-Trace-ID`（受け取り・採番・応答で返す・ログと監査ログの `traceId`）を加える。OpenAPI・実装・テストと aka 版 GUI のクライアントもあわせて直す。provisioner の API 仕様の作成より前に行う（未実施） |
+| 1 | aka-only-server の管理API は `X-Trace-ID` を受け取らず、監査ログにも残さない（2026-10-10 に確認）。provisioner の操作と aka の監査ログを突き合わせる手がかりが、操作者と時刻だけになる | aka-only-server の管理API に、prov と同じ作法の `X-Trace-ID`（受け取り・採番・応答で返す・ログと監査ログの `traceId`）を加える。OpenAPI・実装・テストと aka 版 GUI のクライアントもあわせて直す。provisioner の API 仕様の作成より前に行う。**実施済み（2026-10-10）**: aka-only-server 管理API 0.2.0（`2a6dcf8`）、aka 版 GUI（`b65d30a`）。認証ベクターAPI への追加は aka-only-server の今後の課題（同リポジトリの設計概要 §13.1） |
 | 2 | PLMN マップで `01` に当たる aka 側の加入者を、他の AVクライアントと共有している場合の削除 | provisioner はそれらを本PoCの加入者として扱い、削除では aka 側の加入者ごと削除する（他の AVクライアントとは共有しない前提）。共有が要る場合は、削除で自分の AVクライアントID を外すだけにする案に切り替える |
 
 ## 16. 実装ステップ
