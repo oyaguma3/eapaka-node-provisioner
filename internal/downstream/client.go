@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/trace"
@@ -207,7 +209,7 @@ func IsUnavailable(err error) bool {
 // Request は 1 回の呼び出しの内容。
 type Request struct {
 	Method string
-	// Path は BaseURL からの相対パスの要素。各要素はエスケープして連結する。
+	// Path は BaseURL からの相対パスの要素。各要素は 1 つのセグメントとしてエスケープして連結する。
 	Path  []string
 	Query url.Values
 	// Body は JSON にして送る値。nil なら送らない。
@@ -235,27 +237,96 @@ func (c *Client) Call[T any](ctx context.Context, req Request) (T, error) {
 
 // Send はリクエストを送り、2xx の応答を返す（呼び出し側でボディを閉じる）。それ以外の応答は *Error にして返す。
 func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) {
-	op := OperatorFrom(ctx)
-	traceID := cmp.Or(trace.From(ctx), trace.New())
-
-	u := c.base.JoinPath(req.Path...)
-	u.RawQuery = req.Query.Encode()
-
-	var body io.Reader
+	var body []byte
+	var contentType string
 	if req.Body != nil {
 		b, err := json.Marshal(req.Body)
 		if err != nil {
-			return nil, fmt.Errorf("%s %s %s: encode request: %w", c.name, req.Method, u.Path, err)
+			return nil, fmt.Errorf("%s %s %s: encode request: %w", c.name, req.Method, strings.Join(req.Path, "/"), err)
 		}
-		body = bytes.NewReader(b)
+		body, contentType = b, cmp.Or(req.ContentType, "application/json")
 	}
-	hreq, err := http.NewRequestWithContext(ctx, req.Method, u.String(), body)
+	resp, traceID, err := c.do(ctx, req.Method, req.Path, req.Query.Encode(), body, contentType)
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
+	}
+	defer drainClose(resp.Body)
+	apiErr := &Error{Downstream: c.name, Method: req.Method, Path: resp.Request.URL.Path, Status: resp.StatusCode, TraceID: traceID}
+	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt == "application/problem+json" {
+		// 読めなくても、ステータスコードだけで扱えるようにする。
+		_ = json.UnmarshalRead(io.LimitReader(resp.Body, maxResponseBytes), &apiErr.Problem)
+	}
+	return nil, apiErr
+}
+
+// RelayRequest は中継する要求。本文は検証せずにそのまま送る。
+type RelayRequest struct {
+	Method string
+	// Path は BaseURL からの相対パスの要素。各要素は 1 つのセグメントとしてエスケープして連結する。
+	Path []string
+	// RawQuery はクエリ文字列（エンコード済み）。そのまま送る。
+	RawQuery string
+	// Body は要求の本文。nil なら送らない。
+	Body []byte
+	// ContentType は Body の Content-Type。
+	ContentType string
+}
+
+// RelayResponse は中継する応答。
+type RelayResponse struct {
+	Status int
+	// ContentType と Location は下流の応答のヘッダー（なければ空文字列）。
+	ContentType string
+	Location    string
+	Body        []byte
+}
+
+// Relay は要求をそのまま下流に送り、応答（2xx 以外を含む）をそのまま返す。
+// エラーを返すのは、下流に届かなかった場合と、応答を読めなかった場合だけ。
+func (c *Client) Relay(ctx context.Context, req RelayRequest) (RelayResponse, error) {
+	resp, _, err := c.do(ctx, req.Method, req.Path, req.RawQuery, req.Body, req.ContentType)
+	if err != nil {
+		return RelayResponse{}, err
+	}
+	defer drainClose(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return RelayResponse{}, fmt.Errorf("%s %s %s: read response: %w", c.name, req.Method, resp.Request.URL.Path, err)
+	}
+	return RelayResponse{
+		Status:      resp.StatusCode,
+		ContentType: resp.Header.Get("Content-Type"),
+		Location:    resp.Header.Get("Location"),
+		Body:        body,
+	}, nil
+}
+
+// do はリクエストを送り、応答（ステータスによらない）と、下流が返したトレースID を返す。
+// 操作者とトレースID はコンテキストから取る。
+func (c *Client) do(ctx context.Context, method string, path []string, rawQuery string, body []byte, contentType string) (*http.Response, string, error) {
+	op := OperatorFrom(ctx)
+	traceID := cmp.Or(trace.From(ctx), trace.New())
+
+	u, err := c.url(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s %s: %w", c.name, method, err)
+	}
+	u.RawQuery = rawQuery
+
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	hreq, err := http.NewRequestWithContext(ctx, method, u.String(), rd)
+	if err != nil {
+		return nil, "", err
+	}
 	hreq.Header.Set("Accept", "application/json, application/problem+json")
-	if req.Body != nil {
-		hreq.Header.Set("Content-Type", cmp.Or(req.ContentType, "application/json"))
+	if contentType != "" {
+		hreq.Header.Set("Content-Type", contentType)
 	}
 	if op != "" {
 		hreq.Header.Set(operatorHeader, op)
@@ -265,29 +336,64 @@ func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) 
 	start := time.Now()
 	resp, err := c.hc.Do(hreq)
 	if err != nil {
-		c.log.Warn("downstream call failed", "method", req.Method, "path", u.Path, "trace_id", traceID, "error", err)
-		return nil, fmt.Errorf("%s %s %s: %w", c.name, req.Method, u.Path, err)
+		c.log.Warn("downstream call failed", "method", method, "path", u.Path, "trace_id", traceID, "error", err)
+		return nil, "", fmt.Errorf("%s %s %s: %w", c.name, method, u.Path, err)
 	}
 	// 下流は使ったトレースID を応答で返す（送った値と同じになるはず）。
 	traceID = cmp.Or(resp.Header.Get(trace.Header), traceID)
 	// リクエストとレスポンスのボディ、クエリ文字列は出さない（Ki / OPc や検索条件を含みうるため）。
-	c.log.Debug("downstream call", "method", req.Method, "path", u.Path, "status", resp.StatusCode,
+	c.log.Debug("downstream call", "method", method, "path", u.Path, "status", resp.StatusCode,
 		"duration_ms", time.Since(start).Milliseconds(), "operator", op, "trace_id", traceID)
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return resp, nil
-	}
-	defer drainClose(resp.Body)
-	apiErr := &Error{Downstream: c.name, Method: req.Method, Path: u.Path, Status: resp.StatusCode, TraceID: traceID}
-	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt == "application/problem+json" {
-		// 読めなくても、ステータスコードだけで扱えるようにする。
-		_ = json.UnmarshalRead(io.LimitReader(resp.Body, maxResponseBytes), &apiErr.Problem)
-	}
-	return nil, apiErr
+	return resp, traceID, nil
 }
 
 // drainClose は、接続を再利用できるよう残りのボディを読み捨ててから閉じる。
 func drainClose(body io.ReadCloser) {
 	io.Copy(io.Discard, io.LimitReader(body, maxResponseBytes))
 	body.Close()
+}
+
+// url は BaseURL に path の要素を連結した URL を返す。各要素は 1 つのセグメントとしてエスケープする。
+// url.URL.JoinPath は要素の中の "/" をエスケープしないので使わない（例えば中継で受け取った値 "1/secret" が、
+// 別の操作のパス /clients/1/secret として下流に届かないようにする）。空・"."・".." の要素は、
+// 下流のルーターがパスを正規化して別のパスとして扱いうるので、送らずにエラーにする。
+func (c *Client) url(path []string) (*url.URL, error) {
+	u := *c.base
+	raw := strings.TrimSuffix(c.base.EscapedPath(), "/")
+	for _, p := range path {
+		if p == "" || p == "." || p == ".." {
+			return nil, fmt.Errorf("invalid path element %q", p)
+		}
+		raw += "/" + url.PathEscape(p)
+	}
+	u.RawPath = raw
+	u.Path, _ = url.PathUnescape(raw) // PathEscape したものなので失敗しない
+	return &u, nil
+}
+
+// ---- 一覧の条件 ----
+
+// ListParams は加入者・認可ポリシーの一覧の条件（下流 2 つで同じ）。ゼロ値の項目は指定しない。
+type ListParams struct {
+	// Prefix は IMSI の前方一致条件。
+	Prefix string
+	// Cursor は前のページの NextCursor。
+	Cursor string
+	// Limit は 1 ページの件数（1〜500、省略時は 50）。
+	Limit int
+}
+
+// Query はクエリパラメーターにする。
+func (p ListParams) Query() url.Values {
+	q := url.Values{}
+	if p.Prefix != "" {
+		q.Set("prefix", p.Prefix)
+	}
+	if p.Cursor != "" {
+		q.Set("cursor", p.Cursor)
+	}
+	if p.Limit != 0 {
+		q.Set("limit", strconv.Itoa(p.Limit))
+	}
+	return q
 }

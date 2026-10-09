@@ -42,6 +42,108 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 	return c.Call[Status](ctx, downstream.Request{Method: http.MethodGet, Path: []string{"status"}})
 }
 
+// ---- 加入者（鍵を aka-only-server に置く加入者）----
+
+// SQN 増加タイプ。
+const (
+	SQNTypeInc1  = "inc1"
+	SQNTypeInc32 = "inc32"
+	SQNTypeInc33 = "inc33"
+)
+
+// ProblemDetails の cause の値（aka-only-server の管理API の OpenAPI と同じ）。
+const (
+	CauseUserNotFound     = "USER_NOT_FOUND"
+	CauseSubscriberExists = "SUBSCRIBER_ALREADY_EXISTS"
+)
+
+// Subscriber は加入者。Ki と OPc は含まない。
+type Subscriber struct {
+	IMSI       string `json:"imsi"`
+	SQN        string `json:"sqn"`
+	AMF        string `json:"amf"`
+	SQNType    string `json:"sqnType"`
+	AllowPlain bool   `json:"allowPlain"`
+	// AllowedClientIDs は許可クライアントID（昇順。削除済みクライアントの ID は含まない）。
+	AllowedClientIDs []int64   `json:"allowedClientIds"`
+	CreatedAt        time.Time `json:"createdAt"`
+	// UpdatedAt は最終変更日時。SQN の払い出しでは更新しない。
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// SubscriberCreate は加入者の登録内容。SQN、AMF、SQNType は空なら管理API の既定値になる。
+type SubscriberCreate struct {
+	IMSI             string  `json:"imsi"`
+	Ki               string  `json:"ki"`
+	OPc              string  `json:"opc"`
+	SQN              string  `json:"sqn,omitempty"`
+	AMF              string  `json:"amf,omitempty"`
+	SQNType          string  `json:"sqnType,omitempty"`
+	AllowPlain       bool    `json:"allowPlain"`
+	AllowedClientIDs []int64 `json:"allowedClientIds"`
+}
+
+// SubscriberUpdate は加入者の変更内容（JSON Merge Patch）。nil の項目は変更しない。
+// provisioner は許可クライアント（allowedClientIds）を変更しないので、その項目は持たない（設計概要 §5）。
+type SubscriberUpdate struct {
+	Ki         *string `json:"ki,omitzero"`
+	OPc        *string `json:"opc,omitzero"`
+	SQN        *string `json:"sqn,omitzero"`
+	AMF        *string `json:"amf,omitzero"`
+	SQNType    *string `json:"sqnType,omitzero"`
+	AllowPlain *bool   `json:"allowPlain,omitzero"`
+}
+
+// SubscriberKeys は加入者の Ki と OPc。
+type SubscriberKeys struct {
+	Ki  string `json:"ki"`
+	OPc string `json:"opc"`
+}
+
+// SubscriberList は加入者の一覧の 1 ページ（IMSI の辞書順）。
+type SubscriberList struct {
+	Items []Subscriber `json:"items"`
+	// Total は Prefix に一致する加入者の総数。
+	Total int64 `json:"total"`
+	// NextCursor は次のページがある場合だけ入る。
+	NextCursor string `json:"nextCursor"`
+}
+
+// ListSubscribers は加入者の一覧を IMSI の辞書順で取得する。
+func (c *Client) ListSubscribers(ctx context.Context, p downstream.ListParams) (SubscriberList, error) {
+	return c.Call[SubscriberList](ctx, downstream.Request{Method: http.MethodGet, Path: []string{"subscribers"}, Query: p.Query()})
+}
+
+// CreateSubscriber は加入者を登録する。
+func (c *Client) CreateSubscriber(ctx context.Context, s SubscriberCreate) (Subscriber, error) {
+	return c.Call[Subscriber](ctx, downstream.Request{Method: http.MethodPost, Path: []string{"subscribers"}, Body: s})
+}
+
+// GetSubscriber は加入者を取得する。
+func (c *Client) GetSubscriber(ctx context.Context, imsi string) (Subscriber, error) {
+	return c.Call[Subscriber](ctx, downstream.Request{Method: http.MethodGet, Path: []string{"subscribers", imsi}})
+}
+
+// UpdateSubscriber は加入者を変更する。
+func (c *Client) UpdateSubscriber(ctx context.Context, imsi string, u SubscriberUpdate) (Subscriber, error) {
+	return c.Call[Subscriber](ctx, downstream.Request{
+		Method: http.MethodPatch, Path: []string{"subscribers", imsi}, Body: u, ContentType: "application/merge-patch+json",
+	})
+}
+
+// DeleteSubscriber は加入者を削除する。
+func (c *Client) DeleteSubscriber(ctx context.Context, imsi string) error {
+	_, err := c.Call[struct{}](ctx, downstream.Request{Method: http.MethodDelete, Path: []string{"subscribers", imsi}})
+	return err
+}
+
+// GetSubscriberKeys は加入者の Ki と OPc を取得する。管理API の監査ログに残る。
+func (c *Client) GetSubscriberKeys(ctx context.Context, imsi string) (SubscriberKeys, error) {
+	return c.Call[SubscriberKeys](ctx, downstream.Request{Method: http.MethodGet, Path: []string{"subscribers", imsi, "keys"}})
+}
+
+// ---- AVクライアント ----
+
 // AVClient は AVクライアント（認証ベクターAPI のクライアント）。
 type AVClient struct {
 	ID                int64     `json:"id"`

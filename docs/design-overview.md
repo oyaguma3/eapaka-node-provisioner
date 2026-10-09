@@ -1,6 +1,6 @@
 # eapaka-node-provisioner 設計概要
 
-- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は §16 のステップ 2（骨組み）まで。
+- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は §16 のステップ 3（下流のクライアント、契約テスト、CI）まで。
 - 対象: 統合API（コマンド名 `eapaka-provisioner`。以下「provisioner」）。
 - 関連:
   - 本PoC（eapaka-radius-server-poc）の Provisioning API: `docs/D-13_Provisioning_API詳細設計書_r*.md`、`docs/openapi/provisioning-api.yaml`
@@ -141,6 +141,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 | `/aka/av-clients/{clientId}` | aka の `GET /clients/{clientId}` | 読み取りだけ。vector-gateway の AVクライアントの確認用 |
 
 - 要求と応答の形は、下流と同じにする（BFF が `ProvAPI` の実装を差し替える程度で付け替えられるように）。要求の本文は検証せずにそのまま送り、下流の応答（エラーを含む）をそのまま返す（ProblemDetails に `downstream` を加える）。`Location` は provisioner のパスに書き換える。
+- パスの値（IMSI、ID）は、provisioner で形式を確かめてから下流に送る。下流のクライアントも、値を 1 つのセグメントとしてエスケープし、空・`.`・`..` は送らない（`/clients/1%2Fsecret` のような値が、別の操作 `/clients/1/secret` として下流に届かないようにする）。
 - 下流の監査ログは、下流ごとに形が違う（prov は `details` が文字列、aka は `detail` がオブジェクト）ため、`/audit-logs` の引数で切り替えず、別のパスにする。provisioner 自身の監査ログは `/audit-logs`（§10.2）。aka を設定していなければ `/aka/...` は 404（`DOWNSTREAM_NOT_CONFIGURED`）。
 - 中継の書き込みにも、`X-Operator-Id` の転送、監査ログ、`Idempotency-Key`（§9.2）を適用する。
 
@@ -257,8 +258,8 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 ## 13. 試験
 
 - **単体テスト:** 下流を `httptest` の偽物にして、各手順での失敗（接続できない、409、400、5xx）を注入し、補償・やり直し・応答を確かめる。Valkey を使う部分は、接続先を環境変数で指定したときだけ実際の Valkey で試す。
-- **契約テスト:** 下流の接続先を環境変数で指定したときだけ実行する。テスト用の IMSI（`00101...`）・IP（`198.51.100.0/24` 等）を作り、最後に消す。
-- **CI（GitHub Actions）:** 本PoC と aka-only-server を固定のコミット（`POC_REF` / `AKA_REF`）で checkout してビルドし、契約テストの相手にする。
+- **契約テスト:** 下流の接続先を環境変数（`PROVISIONER_TEST_CLIENT_CERT`、`PROVISIONER_TEST_PROV_URL` / `_PROV_SERVER_CERT`、`PROVISIONER_TEST_AKA_URL` / `_AKA_SERVER_CERT`）で指定したときだけ実行する（`internal/provapi`・`internal/akaapi` の `TestIntegration*`）。テスト用の IMSI（`00101...`）・IP（`198.51.100.0/24`）・AVクライアントを作り、最後に消す。下流の監査ログ（`/audit-logs`）に、操作者・管理クライアント・トレースID が残ることも確かめる。
+- **CI（GitHub Actions）:** 本PoC と aka-only-server を固定のコミット（`POC_REF` / `AKA_REF`）で checkout してバイナリでビルド・起動し、契約テストの相手にする。下流の API を変えたら、その main に入った後のコミットに更新する。
 - **起動しての確認:** 手元（WSL）では下流をバイナリと専用の Valkey コンテナで起動して通しで確かめる。simwifi では、同一ホスト（共有ネットワーク）と別ホスト（Tailscale のアドレス）で、BFF なしで curl から操作し、`aka` の加入者は eapaka_test で認証まで確かめる。
 
 ## 14. 将来拡張
@@ -287,8 +288,8 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 各ステップの終わりに「作ったもの」と「実際に動かして確かめたこと」を報告して確認をもらう。
 
 1. API 仕様（`docs/openapi/provisioner-api.yaml`）の作成 … 作成済み（0.1.0。2026-10-10）
-2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose … 実装済み（2026-10-10）。下流のクライアントは、接続の仕組み（`internal/downstream`）と `/status` に要る呼び出し（両方の状態、aka の AVクライアント）まで。手元と simwifi（同一ホスト）で確認済み
-3. 下流のクライアント（prov / aka。diagnose を含む）と契約テスト、CI
+2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose … 実装済み（2026-10-10）。手元と simwifi（同一ホスト）で確認済み
+3. 下流のクライアント（prov / aka。diagnose を含む）と契約テスト、CI … 実装済み（2026-10-10）。型つきの呼び出しは加入者の統合操作で使うもの（prov の加入者・認可ポリシー、aka の加入者・AVクライアント）。中継（RADIUSクライアント、セッション、監査ログ）は要求と応答をそのまま渡す `Relay` で行う
 4. 中継する操作（§7）、ロック、`Idempotency-Key`、監査ログ
 5. 加入者の統合操作（§6）と操作の記録・要求の中の補償
 6. やり直しのワーカーと `/operations`

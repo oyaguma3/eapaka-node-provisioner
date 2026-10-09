@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -59,5 +60,65 @@ func TestDiagnose(t *testing.T) {
 	}
 	if !strings.Contains(hints.UnknownServer, "PROVISIONER_AKA_SERVER_CERT") || !strings.Contains(hints.ClientRejected, "AKA_ADMIN_CLIENTS") {
 		t.Errorf("hints = %+v", hints)
+	}
+}
+
+func TestSubscriberRequests(t *testing.T) {
+	type req struct{ method, path, contentType, body string }
+	var got []req
+	srv := downstreamtest.NewServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b := make([]byte, r.ContentLength)
+		r.Body.Read(b)
+		got = append(got, req{r.Method, r.URL.Path, r.Header.Get("Content-Type"), string(b)})
+		switch {
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/keys"):
+			downstreamtest.WriteJSON(w, 200, map[string]any{"ki": "00", "opc": "11"})
+		case r.URL.Path == "/admin/v1/subscribers" && r.Method == http.MethodGet:
+			downstreamtest.WriteJSON(w, 200, map[string]any{"items": []any{}, "total": 0})
+		default:
+			downstreamtest.WriteJSON(w, 200, map[string]any{
+				"imsi": "001020000000001", "sqn": "000000000000", "amf": "8000", "sqnType": "inc32",
+				"allowPlain": false, "allowedClientIds": []int{1}, "createdAt": "2026-10-10T00:00:00Z", "updatedAt": "2026-10-10T00:00:00Z",
+			})
+		}
+	})
+	c, err := New(srv.Options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	if _, err := c.ListSubscribers(ctx, downstream.ListParams{Prefix: "00102"}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.CreateSubscriber(ctx, SubscriberCreate{IMSI: "001020000000001", Ki: "aa", OPc: "bb", AllowedClientIDs: []int64{1}})
+	if err != nil || s.SQNType != SQNTypeInc32 || !slices.Equal(s.AllowedClientIDs, []int64{1}) {
+		t.Errorf("create = %+v, %v", s, err)
+	}
+	plain := true
+	if _, err := c.UpdateSubscriber(ctx, "001020000000001", SubscriberUpdate{AllowPlain: &plain}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.GetSubscriber(ctx, "001020000000001"); err != nil {
+		t.Fatal(err)
+	}
+	if k, err := c.GetSubscriberKeys(ctx, "001020000000001"); err != nil || k.Ki != "00" {
+		t.Errorf("keys = %+v, %v", k, err)
+	}
+	if err := c.DeleteSubscriber(ctx, "001020000000001"); err != nil {
+		t.Fatal(err)
+	}
+	want := []req{
+		{"GET", "/admin/v1/subscribers", "", ""},
+		// 既定値に任せる項目（SQN、AMF、SQN 増加タイプ）は送らない。許可フラグと許可クライアントは送る。
+		{"POST", "/admin/v1/subscribers", "application/json", `{"imsi":"001020000000001","ki":"aa","opc":"bb","allowPlain":false,"allowedClientIds":[1]}`},
+		{"PATCH", "/admin/v1/subscribers/001020000000001", "application/merge-patch+json", `{"allowPlain":true}`},
+		{"GET", "/admin/v1/subscribers/001020000000001", "", ""},
+		{"GET", "/admin/v1/subscribers/001020000000001/keys", "", ""},
+		{"DELETE", "/admin/v1/subscribers/001020000000001", "", ""},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("requests =\n%v\nwant\n%v", got, want)
 	}
 }

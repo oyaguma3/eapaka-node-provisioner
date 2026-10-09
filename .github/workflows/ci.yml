@@ -1,0 +1,196 @@
+# テスト、イメージのビルドと compose の設定の確認、下流（本PoCの Provisioning API と aka-only-server の管理API）との契約テストを行う。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# 同じブランチで新しく push したら、古い実行は止める。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: テスト
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      # internal/store の結合テストに使う。論理データベース 1 番を空にして使う。
+      valkey:
+        image: valkey/valkey:9
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: 整形の確認
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt で整形されていないファイル:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: テスト（Valkey の結合テストを含む）
+        env:
+          PROVISIONER_TEST_VALKEY_ADDR: localhost:6379
+        run: go test -race -count=1 ./...
+      - name: Valkey の結合テストが実行されたことの確認
+        env:
+          PROVISIONER_TEST_VALKEY_ADDR: localhost:6379
+        run: |
+          set -o pipefail
+          # 接続先がなければ結合テストはスキップされ、テスト自体は成功してしまうので、別に確かめる。
+          go test -count=1 -v ./internal/store/ | tee store.log
+          if grep -q -- '--- SKIP' store.log; then
+            echo "Valkey の結合テストがスキップされました"
+            exit 1
+          fi
+
+  docker:
+    name: イメージと compose の設定
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: イメージのビルド
+        run: docker build --build-arg VERSION="${GITHUB_SHA::7}" -t eapaka-provisioner:ci .
+      - name: compose の設定（下流が同一ホストと別ホスト）
+        run: |
+          cp .env.example .env
+          sed -i 's|^PROVISIONER_VALKEY_PASSWORD=.*|PROVISIONER_VALKEY_PASSWORD=ci|' .env
+          docker compose config -q
+          docker compose config --services
+          COMPOSE_FILE=compose.yaml docker compose config -q
+          COMPOSE_FILE=compose.yaml:compose.eapaka-prov.yaml docker compose config -q
+          COMPOSE_FILE=compose.yaml:compose.aka-av.yaml docker compose config -q
+
+  contract:
+    name: 下流との契約テスト
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # 契約テストの相手にする下流のコミット。下流の API を変えたら、その main に入った後のコミットに更新する。
+      POC_REF: def95e59143c27ca011b81e3ed90f8edcc0762a6
+      AKA_REF: 2a6dcf84c82313e5e1b67035ad17083c2ec868c2
+    services:
+      # 下流がそれぞれ使う Valkey（このジョブ専用で、テストデータは最後に消える）。
+      prov-valkey:
+        image: valkey/valkey:9
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      aka-valkey:
+        image: valkey/valkey:9
+        ports:
+          - 16380:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: oyaguma3/eapaka-radius-server-poc
+          ref: ${{ env.POC_REF }}
+          path: eapaka-radius-server-poc
+      - uses: actions/checkout@v7
+        with:
+          repository: oyaguma3/aka-only-server
+          ref: ${{ env.AKA_REF }}
+          path: aka-only-server
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: 下流と eapaka-provisioner のビルド
+        run: |
+          git -C eapaka-radius-server-poc log -1 --format='本PoC: %h %s'
+          git -C aka-only-server log -1 --format='aka-only-server: %h %s'
+          (cd eapaka-radius-server-poc/apps/provisioning-api && go build -o "$RUNNER_TEMP/provisioning-api" .)
+          (cd aka-only-server && go build -o "$RUNNER_TEMP/aka-only-server" ./cmd/aka-only-server)
+          go build -o "$RUNNER_TEMP/eapaka-provisioner" ./cmd/eapaka-provisioner
+      - name: 証明書の作成と下流の起動
+        working-directory: ${{ runner.temp }}
+        run: |
+          # provisioner のクライアント証明書を作り、表示された値で下流 2 つに登録する。
+          ./eapaka-provisioner gen-client-cert -name provisioner-ci > client.pem 2> gen.txt
+          cat gen.txt
+          prov_clients=$(sed -n 's/^PROVISIONING_API_ADMIN_CLIENTS=//p' gen.txt)
+          aka_clients=$(sed -n 's/^AKA_ADMIN_CLIENTS=//p' gen.txt)
+
+          # provisioning-api のサーバー証明書は本PoCの B-02 §15.2 と同じ手順で作る。
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -keyout prov-server.key -out prov-server.pem -days 825 -subj "/CN=provisioning-api" \
+            -addext "subjectAltName=DNS:provisioning-api,DNS:localhost,IP:127.0.0.1"
+          PROVISIONING_API_LISTEN_ADDR=127.0.0.1:19444 \
+          PROVISIONING_API_TLS_CERT=prov-server.pem PROVISIONING_API_TLS_KEY=prov-server.key \
+          PROVISIONING_API_ADMIN_CLIENTS="$prov_clients" PROVISIONING_API_NODE_NAME=ci-node \
+          REDIS_HOST=127.0.0.1 REDIS_PORT=16379 LOG_LEVEL=INFO \
+            nohup ./provisioning-api > provisioning-api.log 2>&1 &
+
+          # aka-only-server。vector-gateway の代わりの AVクライアント（ID 1）を登録しておく。
+          export AKA_VALKEY_ADDR=127.0.0.1:16380
+          ./aka-only-server client gen-cert -name vector-gateway > vector-gateway.pem
+          ./aka-only-server client add -name vector-gateway -cert vector-gateway.pem
+          AKA_ADMIN_ADDR=127.0.0.1:19443 AKA_AV_TLS_ADDR=127.0.0.1:18443 \
+          AKA_ADMIN_TLS_HOSTS=localhost,127.0.0.1 AKA_AV_TLS_HOSTS=localhost,127.0.0.1 \
+          AKA_ADMIN_CLIENTS="$aka_clients" \
+            nohup ./aka-only-server > aka-only-server.log 2>&1 &
+          for i in $(seq 1 30); do
+            ./aka-only-server admin-cert > aka-server.pem 2>/dev/null && grep -q 'BEGIN CERTIFICATE' aka-server.pem && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: 下流に接続できるまで待つ
+        env:
+          PROVISIONER_CLIENT_CERT: ${{ runner.temp }}/client.pem
+          PROVISIONER_PROV_URL: https://127.0.0.1:19444/admin/v1
+          PROVISIONER_PROV_SERVER_CERT: ${{ runner.temp }}/prov-server.pem
+          PROVISIONER_AKA_URL: https://127.0.0.1:19443/admin/v1
+          PROVISIONER_AKA_SERVER_CERT: ${{ runner.temp }}/aka-server.pem
+          PROVISIONER_AKA_AV_CLIENT_ID: "1"
+        run: |
+          for i in $(seq 1 30); do
+            "$RUNNER_TEMP/eapaka-provisioner" check-downstream && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: 契約テスト
+        env:
+          PROVISIONER_TEST_CLIENT_CERT: ${{ runner.temp }}/client.pem
+          PROVISIONER_TEST_PROV_URL: https://127.0.0.1:19444/admin/v1
+          PROVISIONER_TEST_PROV_SERVER_CERT: ${{ runner.temp }}/prov-server.pem
+          PROVISIONER_TEST_AKA_URL: https://127.0.0.1:19443/admin/v1
+          PROVISIONER_TEST_AKA_SERVER_CERT: ${{ runner.temp }}/aka-server.pem
+        run: |
+          set -o pipefail
+          go test -count=1 -race -run Integration -v ./internal/provapi/ ./internal/akaapi/ | tee contract.log
+          # 接続先の指定が漏れると契約テストはスキップされ、テスト自体は成功してしまうので、別に確かめる。
+          if grep -q -- '--- SKIP' contract.log; then
+            echo "契約テストがスキップされました"
+            exit 1
+          fi
+      - name: 下流のログ（失敗時）
+        if: failure()
+        run: |
+          echo "---- provisioning-api ----"; cat "$RUNNER_TEMP/provisioning-api.log"
+          echo "---- aka-only-server ----"; cat "$RUNNER_TEMP/aka-only-server.log"

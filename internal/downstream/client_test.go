@@ -223,3 +223,95 @@ func TestDiagnose(t *testing.T) {
 		t.Errorf("nil: %q", got)
 	}
 }
+
+func TestRelay(t *testing.T) {
+	type captured struct {
+		method, path, query, contentType, operator, trace, body string
+	}
+	var got captured
+	srv := downstreamtest.NewServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b := make([]byte, r.ContentLength)
+		r.Body.Read(b)
+		got = captured{r.Method, r.URL.EscapedPath(), r.URL.RawQuery, r.Header.Get("Content-Type"),
+			r.Header.Get("X-Operator-Id"), r.Header.Get("X-Trace-ID"), string(b)}
+		switch r.Method {
+		case http.MethodPost:
+			w.Header().Set("Location", "/admin/v1/clients/7")
+			downstreamtest.WriteJSON(w, 201, map[string]any{"id": 7})
+		default:
+			downstreamtest.WriteProblem(w, 409, `{"title":"Conflict","status":409,"cause":"CLIENT_ALREADY_EXISTS"}`)
+		}
+	})
+	c := newClient(t, srv)
+	ctx := downstream.WithOperator(trace.With(t.Context(), "trace-relay"), "alice")
+
+	// 本文はそのまま送り、Location とステータスを返す。
+	resp, err := c.Relay(ctx, downstream.RelayRequest{
+		Method: http.MethodPost, Path: []string{"clients"}, RawQuery: "a=1&b=%2F",
+		Body: []byte(`{"ip":"198.51.100.1", "unknown":true}`), ContentType: "application/json; charset=utf-8",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != 201 || resp.Location != "/admin/v1/clients/7" || resp.ContentType != "application/json" ||
+		strings.TrimSpace(string(resp.Body)) != `{"id":7}` {
+		t.Errorf("resp = %+v (%s)", resp, resp.Body)
+	}
+	want := captured{"POST", "/admin/v1/clients", "a=1&b=%2F", "application/json; charset=utf-8", "alice", "trace-relay",
+		`{"ip":"198.51.100.1", "unknown":true}`}
+	if got != want {
+		t.Errorf("request = %+v, want %+v", got, want)
+	}
+
+	// 2xx 以外もエラーにせず、そのまま返す。パスの要素はエスケープする。
+	resp, err = c.Relay(ctx, downstream.RelayRequest{Method: http.MethodPatch, Path: []string{"clients", "a/b"}})
+	if err != nil || resp.Status != 409 || resp.ContentType != "application/problem+json" ||
+		!strings.Contains(string(resp.Body), "CLIENT_ALREADY_EXISTS") || got.path != "/admin/v1/clients/a%2Fb" || got.contentType != "" {
+		t.Errorf("relay 409: %+v, %v (request %+v)", resp, err, got)
+	}
+
+	// 届かなければエラー。
+	srv.Options.BaseURL = "https://" + downstreamtest.ClosedAddr(t) + "/admin/v1"
+	srv.Options.Timeout = 500 * time.Millisecond
+	if _, err := newClient(t, srv).Relay(ctx, downstream.RelayRequest{Method: http.MethodGet, Path: []string{"clients"}}); !downstream.IsUnavailable(err) {
+		t.Errorf("unreachable: %v", err)
+	}
+}
+
+func TestListParams(t *testing.T) {
+	if q := (downstream.ListParams{}).Query().Encode(); q != "" {
+		t.Errorf("zero = %q", q)
+	}
+	if q := (downstream.ListParams{Prefix: "00101", Cursor: "001010000000005", Limit: 20}).Query().Encode(); q != "cursor=001010000000005&limit=20&prefix=00101" {
+		t.Errorf("query = %q", q)
+	}
+}
+
+func TestPathEscape(t *testing.T) {
+	var got []string
+	srv := downstreamtest.NewServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.EscapedPath())
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := newClient(t, srv)
+	// "/" を含む値も 1 つのセグメントとして送る（別のパスにならない）。
+	for _, v := range []string{"1/secret", "a b", "%2F", "..x"} {
+		if _, err := c.Call[struct{}](t.Context(), downstream.Request{Method: http.MethodDelete, Path: []string{"clients", v}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"/admin/v1/clients/1%2Fsecret", "/admin/v1/clients/a%20b", "/admin/v1/clients/%252F", "/admin/v1/clients/..x"}
+	if !slices.Equal(got, want) {
+		t.Errorf("paths = %q, want %q", got, want)
+	}
+	// 空・"."・".." は送らない。
+	for _, v := range []string{"", ".", ".."} {
+		_, err := c.Relay(t.Context(), downstream.RelayRequest{Method: http.MethodGet, Path: []string{"clients", v, "secret"}})
+		if err == nil {
+			t.Errorf("%q: want error", v)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("requests were sent: %q", got[len(want):])
+	}
+}
