@@ -1,0 +1,289 @@
+# eapaka-node-provisioner 設計概要
+
+- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は未着手。
+- 対象: 統合API（コマンド名 `eapaka-provisioner`。以下「provisioner」）。
+- 関連:
+  - 本PoC（eapaka-radius-server-poc）の Provisioning API: `docs/D-13_Provisioning_API詳細設計書_r*.md`、`docs/openapi/provisioning-api.yaml`
+  - aka-only-server の管理API: `docs/design-overview.md`、`docs/openapi/admin-api.yaml`
+  - Vector Gateway の接続方式と PLMN マップ: 本PoCの `docs/D-12_Vector_Gateway_詳細設計書_r*.md`
+  - 手本にする実装: web-gui-for-eapaka-radius（以下「BFF」）の `internal/provapi`、web-gui-for-aka-only-server の `internal/adminapi`
+- API の契約: `docs/openapi/provisioner-api.yaml`（次の作業で作成する）
+
+## 1. 位置づけ
+
+EAP-AKA RADIUS PoC（以下「本PoC」）の Provisioning API と、aka-only-server の管理API を組み合わせて操作する統合API。加入者を「IMSI＋鍵の置き場所＋認可ポリシー」として扱い、2 つのノードにまたがる操作の調整（順序、排他、失敗時の補償）を受け持つ。
+
+```
+[BFF など] ──mTLS（X-Operator-Id / X-Trace-ID / Idempotency-Key）──> [provisioner] ──> Valkey（provisioner 専用）
+                                                                       ├─mTLS─> provisioning-api（本PoC。以下「prov」）
+                                                                       └─mTLS─> aka-only-server 管理API（以下「aka」）
+```
+
+- 加入者の鍵の置き場所は、本PoCの Vector Gateway の接続方式に対応する 2 つ:
+  - `poc`（接続方式 `00`）: 鍵（Ki / OPc）を本PoCの `sub:{IMSI}` に持つ。prov の `/subscribers` で操作する。
+  - `aka`（接続方式 `01`）: 鍵を aka-only-server が持ち、本PoCの vector-gateway が aka-only-server の AVクライアントとして認証ベクターを取得する。aka の `/subscribers` で操作する。
+- 認可ポリシー（`policy:{IMSI}`）は、置き場所によらず本PoCに持つ。prov の `/policies` で操作する。
+- 正本は下流の 2 つ（prov / aka）であり、provisioner は加入者のデータを保存しない。provisioner の Valkey に持つのは、操作の記録・排他・再送の判定・監査ログだけである（§8）。
+- 画面のロジックは持たない（BFF の責務）。ユーザーや権限の概念も持たず、管理クライアントを全権として扱う（下流と同じ）。
+
+## 2. 範囲
+
+| 区分 | 内容 |
+|---|---|
+| 対象 | 本PoC 1 ノードと aka-only-server 1 台の組。加入者の統合操作（作成・取得・変更・削除・鍵の取得・一覧）、RADIUSクライアント・認可ポリシー・セッション・監査ログの中継、vector-gateway の AVクライアントの参照、操作の記録と補償・やり直し |
+| 対象外 | 複数ノード、AVクライアントと AV用サーバー証明書の管理（aka 版 GUI で行う）、aka-only-server のサーバーログの参照、CSV の一括操作（本PoCの Admin TUI だけで行う）、セッションの切断、操作者ごとの権限、IPv6 の RADIUSクライアント |
+
+将来の拡張は §14。
+
+## 3. 技術方針
+
+他の Go のリポジトリ（aka-only-server、BFF 2 つ）と同じ。
+
+- 言語: Go 1.27.1。標準ライブラリを優先する（`net/http` のメソッドつき ServeMux と `r.PathValue`、`crypto/tls`、`encoding/json/v2`、`log/slog`）。
+- 外部依存は `github.com/valkey-io/valkey-go` だけとする（プロジェクト全体で認めてきたもの）。
+- module パス: `github.com/oyaguma3/eapaka-node-provisioner`。コマンド名は `eapaka-provisioner`。
+- 設定は環境変数だけで受け取り、名前の接頭辞は `PROVISIONER_` とする（§11）。
+- 配備: Docker Compose（provisioner と専用の Valkey）。コンテナは distroless の nonroot（UID 65532）で動かす。
+- 下流の API のクライアントは、BFF の `internal/provapi` と aka 版 GUI の `internal/adminapi` をコピーして手直しする（共有モジュールにはしない）。
+- コードのコメントとドキュメントは日本語で書く。
+- ブランチは `main` に直接コミットする（他の GUI と aka-only-server と同じ）。
+
+## 4. 鍵の置き場所の決め方
+
+本PoCの vector-gateway は、IMSI の PLMN と `VECTOR_GATEWAY_PLMN_MAP` で接続方式を決める（D-12 §3）。鍵をそれと違う所に置くと、その加入者は認証できない。provisioner は同じ規則で置き場所を決める。
+
+- 環境変数 `PROVISIONER_PLMN_MAP` に、本PoCの `VECTOR_GATEWAY_PLMN_MAP` と同じ形式（`PLMN:ID,PLMN:ID,...`）で同じ値を設定する。両者は運用で揃える（provisioner からは本PoCのマップを読めない）。`/status` にマップを出し、目で比べられるようにする。
+- IMSI の先頭 6 桁、次に先頭 5 桁の順でマップと照合する（D-12 §3.4 と同じ）。`01` に当たれば `aka`、それ以外（一致なし、`00`）は `poc`。
+- マップに `00` / `01` 以外の ID があれば、設定の誤りとして起動しない（provisioner はそれ以外の接続方式を扱えない）。aka の接続先（`PROVISIONER_AKA_URL`）を設定していないのに `01` があれば、同じく起動しない。
+- 加入者の作成で呼び出し側が `keyStore` を指定した場合、マップから決まるものと違えば 400（`KEY_STORE_MISMATCH`）とする。省略すればマップから決める。
+- 置き場所の変更（`poc` と `aka` の間で鍵を移す）は扱わない。PLMN 単位で切り替わるため、1 加入者だけを移すことはできない（§14 のジョブで検討する）。
+
+## 5. vector-gateway の AVクライアント
+
+`aka` の加入者は、aka-only-server の「許可クライアントID の集合」（`allowedClientIds`）に、本PoCの vector-gateway の AVクライアントID を含める必要がある（aka-only-server の設計 §7.2）。
+
+- 環境変数 `PROVISIONER_AKA_AV_CLIENT_ID` にその ID を設定する（aka 版 GUI の AVクライアントの一覧で確かめる）。
+- 起動時と `/status` で、aka の `GET /clients/{id}` によりその ID が存在して有効かを確かめ、ログと `/status` に出す。存在しなくても provisioner は起動する（`aka` の加入者の作成は aka が `CLIENT_NOT_FOUND` で断る）。
+- `aka` の加入者の作成では `allowedClientIds` をこの ID だけにする。
+- `aka` の加入者の変更では `allowedClientIds` を送らない（aka 側に他の AVクライアントの ID があっても消さない）。
+- PLMN マップで `01` に当たる IMSI の aka 側の加入者は、本PoCの加入者として扱う（§15 の 2）。
+
+## 6. 加入者の統合操作
+
+### 6.1 リソースの形（概要）
+
+項目の詳細は OpenAPI で定める。
+
+```json
+{
+  "imsi": "001010000000001",
+  "keyStore": "aka",
+  "key": { "amf": "8000", "sqn": "000000000020", "sqnType": "inc32", "allowPlain": false, "createdAt": "..." },
+  "policy": { "default": "allow", "rules": [] },
+  "issues": []
+}
+```
+
+- `key` は置き場所の加入者の属性（Ki / OPc は含まない）。`sqnType` / `allowPlain` / `allowedClientIds` / `updatedAt` は `aka` のときだけ含む。
+- `policy` は prov の認可ポリシー。ない場合は省略する。
+- `issues` は 2 つのノードの状態の食い違い（下表）。正常なら空。
+
+| `issues` の値 | 状態 |
+|---|---|
+| `KEY_MISSING` | 置き場所に鍵（加入者）がない |
+| `POLICY_MISSING` | 認可ポリシーがない（本PoCは認証を拒否する。D-09 §8.7） |
+| `KEY_IN_OTHER_STORE` | 置き場所でない方にも鍵がある（`poc` なのに aka に、`aka` なのに prov に） |
+| `AV_CLIENT_NOT_ALLOWED` | `aka` の加入者の `allowedClientIds` に vector-gateway の AVクライアントID がない |
+
+### 6.2 操作
+
+| 操作 | 下流への呼び出し（順） | 失敗したとき |
+|---|---|---|
+| 作成 `POST /subscribers` | ① 3 か所の存在確認（prov の加入者・aka の加入者・ポリシー）。どれかがあれば 409 ② 置き場所に加入者を作成 ③ ポリシーを PUT | ③ が失敗したら ② を削除して戻す（補償） |
+| 取得 `GET /subscribers/{imsi}` | prov の加入者・aka の加入者・ポリシーを並行して取得 | 3 か所のどこにもなければ 404 |
+| 変更 `PATCH /subscribers/{imsi}` | ① 変更前のポリシーを記録 ② ポリシーを PUT（`policy` を指定したとき） ③ 置き場所の加入者を PATCH（鍵の属性を指定したとき） | ③ が失敗したら ② を変更前に戻す（変更前になければ削除） |
+| 削除 `DELETE /subscribers/{imsi}` | ① ポリシーを削除 ② 置き場所の加入者を削除（どちらも 404 は削除済みとして扱う） | 戻せないため、残りを後でやり直す（前に進める） |
+| 鍵の取得 `GET /subscribers/{imsi}/keys` | 置き場所の `/subscribers/{imsi}/keys` | — |
+| 一覧 `GET /subscribers` | §6.4 | — |
+
+- 作成では、鍵の値（Ki / OPc）と `policy` を必須とする。ポリシーのない加入者は認証できないため。
+- 作成で鍵を先に作るのは、途中の状態（鍵だけある）でも認証が拒否されるため（ポリシーがない）。削除でポリシーを先に消すのも同じ理由（以後の認証は拒否される）。
+- 変更では、変更前のポリシーは記録できるが、変更前の Ki / OPc は provisioner の Valkey に残さない（§8）。このため、戻す必要のあるポリシーの変更を先に行い、戻せない鍵の変更を最後にする。
+- `keyStore` は変更できない（§4）。
+- 作成と変更の入力は、下流と同じ規則で provisioner が先に検証する（IMSI、16進の桁数、ポリシーの規則。規則は OpenAPI に書く）。下流への書き込みを始めてから検証で断られて補償する、という流れを通常は起こさないため。下流の検証は最後の守りとして残る（断られたら補償する）。
+- 存在確認（①）から書き込みまでの間に、Admin TUI や aka 版 GUI で同じ IMSI を作られた場合は、下流の 409 で失敗して補償する。
+
+### 6.3 下流のエラーの返し方
+
+- 下流の 400 は、`invalidParams` の `param` を統合リソースの項目名に付け替えて返す（例: ポリシーの `rules[0].vlanId` → `policy.rules[0].vlanId`）。
+- 下流に接続できない・タイムアウトは 503（`DOWNSTREAM_UNAVAILABLE`）、下流の想定外の応答（5xx、ProblemDetails でない応答）は 502（`DOWNSTREAM_ERROR`）。どちらも ProblemDetails の拡張項目 `downstream`（`prov` / `aka`）と、分かれば下流の `cause` を含める。接続できない原因の見当（diagnose）はログと `/status` に出す。
+
+### 6.4 一覧
+
+prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同じ `cursor`（IMSI）と `prefix` で取り寄せ、IMSI の昇順にマージする。
+
+- 3 つとも IMSI の昇順で返すので、それぞれから `limit` 件を取れば、和集合の先頭 `limit` 件は正しく求まる。和集合が `limit` 件を超えるか、どれかに続きがあれば、返した最後の IMSI を `nextCursor` にする。
+- aka の加入者は、PLMN マップで `01` に当たる IMSI だけを対象にする。aka-only-server には本PoCと関係のない加入者もいるため。除いた分だけ件数が足りなくなれば、aka の次のページを取り寄せる。
+- 各項目には、置き場所、鍵とポリシーの有無、`issues` を含める。
+- 正確な `total`（和集合の件数）は返さない（§14 の一覧の改善）。
+
+## 7. 中継する操作
+
+| provisioner のパス | 下流 | 備考 |
+|---|---|---|
+| `/clients`、`/clients/{clientId}`、`/clients/{clientId}/secret` | prov の同じパス | RADIUSクライアント |
+| `/policies`、`/policies/{imsi}` | prov の同じパス | 加入者の操作と同じ IMSI のロックを取る（§9.1） |
+| `/sessions` | prov の `/sessions` | 読み取りだけ |
+| `/av-clients/{clientId}` | aka の `GET /clients/{clientId}` | 読み取りだけ。vector-gateway の AVクライアントの確認用 |
+| `/audit-logs?source=prov`、`?source=aka` | 各下流の `/audit-logs` | 既定（`source` なし）は provisioner 自身の監査ログ（§10.2） |
+
+- 要求と応答の形は、下流と同じにする（BFF が `ProvAPI` の実装を差し替える程度で付け替えられるように）。
+- 中継の書き込みにも、`X-Operator-Id` の転送、監査ログ、`Idempotency-Key`（§9.2）を適用する。
+
+## 8. データモデル（provisioner 専用 Valkey）
+
+| キー | 型 | 内容 |
+|---|---|---|
+| `op:{opId}` | Hash | 操作の記録（§9.3）。種類、IMSI、手順ごとの状態、状態、試行回数、操作者、管理クライアント、トレースID、作成・更新日時。完了したものは一定期間（既定 7 日）で消す |
+| `ops:active` | Sorted Set | 未完了の操作の ID（スコアは次に処理してよい時刻） |
+| `lock:imsi:{imsi}` | String | IMSI ごとのロック（値は取得者のトークン。有効期限つき） |
+| `idem:{mgmtClient}:{keyHash}` | Hash | 再送の判定（§9.2）。要求のハッシュ、処理中かどうか、応答（ステータスと本文）。有効期限 24 時間 |
+| `audit` | Stream | provisioner の監査ログ（§10.2）。件数の上限つき |
+
+- 秘密の値（Ki / OPc、共有シークレット）は保存しない。`op:` には変更前のポリシー（秘密の値を含まない）だけを残す。`idem:` に残す応答は書き込みの応答で、秘密の値を含まない。要求は本文を保存せず、ハッシュ（SHA-256）だけを残す。
+- AOF を有効にして `appendfsync always` とする。ポートは公開せず、`requirepass` を設定する（aka-only-server・BFF と同じ）。
+- Valkey に接続できないとき、書き込み（ロックと操作の記録が要る）は 503（`SYSTEM_FAILURE`）で断り、下流は呼ばない。読み取りは続けて行う。
+
+## 9. 排他・再送・操作の記録
+
+### 9.1 IMSI ごとのロック
+
+- 加入者の作成・変更・削除と、ポリシーの PUT・DELETE は、`lock:imsi:{imsi}` を `SET NX PX` で取ってから行う。取れなければ待たずに 409（`OPERATION_IN_PROGRESS`）を返す。
+- 有効期限は、1 つの操作にかかる最大の時間（下流の呼び出しのタイムアウト × 手順の数）より長くする（既定 60 秒）。解放はトークンを比べて消す（Lua）。
+- ロックは provisioner を通る操作どうしでだけ効く。Admin TUI、aka 版 GUI、下流の API を直接呼ぶ操作とは排他できない（下流に条件つきの書き込みがないため）。provisioner を使う間は、同じ加入者をそれらで操作しない運用とする。
+
+### 9.2 再送の判定（Idempotency-Key）
+
+- 書き込みの要求に任意のヘッダー `Idempotency-Key`（印字可能 ASCII 1〜128 文字）を付けられる。
+- 同じ管理クライアントから同じキーで届いた要求は、24 時間のあいだ、最初の応答をそのまま返す（下流は呼ばない）。
+- 最初の要求がまだ処理中なら 409（`OPERATION_IN_PROGRESS`）、同じキーで要求の内容（メソッド・パス・本文）が違えば 422（`IDEMPOTENCY_KEY_MISMATCH`）。
+- ヘッダーがなければ判定しない（従来どおり、作成のやり直しは 409 で分かる）。
+
+### 9.3 操作の記録と補償
+
+複数の手順からなる操作（加入者の作成・変更・削除）は、下流を呼ぶ前に `op:{opId}` を作り、手順を進めるたびに状態を書き込む。
+
+| 状態 | 意味 |
+|---|---|
+| `running` | 要求を処理中 |
+| `completed` | すべての手順が成功した |
+| `rolled_back` | 途中で失敗し、補償で元に戻した |
+| `retrying` | 補償（作成・変更）または残りの手順（削除）が失敗し、後でやり直す |
+| `failed` | やり直しの上限に達した。手での対応が要る |
+
+- **要求の中の補償:** 途中で失敗したら、その場で補償する。戻せたら `rolled_back` とし、最初の失敗のエラーに `operationId` を付けて返す。
+- **戻せなかったとき:** `retrying` にし、500（`OPERATION_INCOMPLETE`）に `operationId` と残った手順を付けて返す。ERROR のログを出す。
+- **やり直し:** provisioner の中のワーカーが一定間隔（既定 30 秒）で `ops:active` を見て、処理してよい時刻を過ぎた操作の IMSI のロックを取り、続きを行う。作成と変更は補償を続け（後ろに戻す）、削除は残りの削除を続ける（前に進める）。間隔を広げながら繰り返し、上限（既定 24 時間）を超えたら `failed` にする。
+- **プロセスが落ちたとき:** `running` のまま更新されない操作も、ロックの有効期限を過ぎればワーカーが拾って同じように処理する。下流を呼んだ後、記録を書く前に落ちた場合に備え、補償とやり直しは何度行っても結果が同じ操作（削除の 404 は成功とみなす、ポリシーの PUT）だけで組む。
+- **確認と手での対応:** `GET /operations`（未完了・失敗の一覧）、`GET /operations/{opId}`、`POST /operations/{opId}/retry`（`failed` をやり直しに戻す）、`POST /operations/{opId}/dismiss`（手で直した後に閉じる）。件数は `/status` にも出す。
+
+## 10. 認証・操作者・トレース・ログ
+
+### 10.1 provisioner の API の認証
+
+- 下流と同じく mTLS 必須とし、クライアント証明書の SHA-256 フィンガープリントを固定する。管理クライアントは `PROVISIONER_ADMIN_CLIENTS`（`識別名=フィンガープリント,...`）で静的に設定する。識別名は監査ログの `mgmtClient` になる。
+- サーバー証明書は自己署名（ファイルがなければ起動時に生成し、ボリュームに保存する。SAN は `PROVISIONER_TLS_HOSTS`）または持ち込み。BFF のブラウザ向け HTTPS と同じ作り。`eapaka-provisioner server-cert` で現在の証明書（PEM）とフィンガープリントを表示し、BFF に検証用として渡す。
+- TLS 1.2 以上、HTTP/2 に対応する。
+
+### 10.2 操作者・トレースID・監査ログ
+
+- `X-Operator-Id`（`^[A-Za-z0-9._@-]{1,64}$`）を受け取り、そのまま下流 2 つに渡す。下流の監査ログには「操作者＝BFF の利用者、`mgmt_client`＝provisioner」が残る。
+- `X-Trace-ID`（印字可能 ASCII 1〜64 文字）を受け取るか採番し（16 バイトの乱数の 16 進 32 桁）、同じ値を下流 2 つに渡して応答のヘッダーでも返す。prov はログと監査ログに記録する。aka-only-server の管理API は現状 `X-Trace-ID` を記録しない（§15 の 1）。
+- provisioner の監査ログは、標準出力（JSON）に出し、あわせて Valkey の Stream `audit` に保存する（上限 `PROVISIONER_AUDIT_MAX`、既定 10000）。保存に失敗しても操作は成功として扱い、ERROR のログを出す（prov と同じ）。
+- 監査ログの項目: `id`、`time`、`operator`、`mgmtClient`、`action`、`target`、`traceId`、`operationId`、`result`（`completed` / `rolled_back` / `retrying` / `failed`）、`details`（下流ごとの結果。秘密の値は含まない）。`action` は下流と同じ命名（`subscriber.create` 等）に、`operation.retry` / `operation.dismiss` を加える。
+- 秘密の値の取得（`/subscribers/{imsi}/keys`、`/clients/{clientId}/secret`）も、そのたびに監査ログに残す（値は残さない）。
+
+### 10.3 アプリケーションログ
+
+- `log/slog` の JSON を標準出力に出す（ローテーションは Docker に任せる）。要求ごとの `request completed`、下流の呼び出しの結果、補償・やり直しの経過、起動時の下流への接続の確認を出す。
+- 秘密の値はログに出さない（要求・応答の本文はログに出さない）。
+
+## 11. 設定（環境変数）
+
+主なもの。一覧と既定値は `.env.example` と運用ガイドに書く。
+
+| 変数 | 内容 | 既定 |
+|---|---|---|
+| `PROVISIONER_ADDR` | 待ち受け | `:9446` |
+| `PROVISIONER_TLS_CERT` / `_TLS_KEY` / `_TLS_HOSTS` | サーバー証明書・秘密鍵（なければ生成）、生成時の SAN | `/data/tls/...`、`localhost,127.0.0.1,eapaka-provisioner` |
+| `PROVISIONER_ADMIN_CLIENTS` | 管理クライアント（`識別名=フィンガープリント,...`）。空なら起動しない | — |
+| `PROVISIONER_CLIENT_CERT` / `_CLIENT_KEY` | 下流 2 つに使うクライアント証明書と秘密鍵 | — |
+| `PROVISIONER_PROV_URL` / `_PROV_SERVER_CERT` | prov のベースURL、検証に使うサーバー証明書 | `https://provisioning-api:9444/admin/v1` |
+| `PROVISIONER_AKA_URL` / `_AKA_SERVER_CERT` | aka のベースURL、検証に使うサーバー証明書。URL が空なら `aka` を扱わない | （空） |
+| `PROVISIONER_PLMN_MAP` | PLMN マップ（§4） | （空。すべて `poc`） |
+| `PROVISIONER_AKA_AV_CLIENT_ID` | vector-gateway の AVクライアントID（§5）。aka を使うなら必須 | — |
+| `PROVISIONER_DOWNSTREAM_TIMEOUT` | 下流の 1 回の呼び出しのタイムアウト | `5s` |
+| `PROVISIONER_VALKEY_ADDR` / `_VALKEY_PASSWORD` | 専用 Valkey | `valkey:6379` |
+| `PROVISIONER_AUDIT_MAX` | 監査ログの件数の上限 | `10000` |
+| `PROVISIONER_LOG_LEVEL` | ログの水準 | `info` |
+
+- 下流のクライアント証明書は 1 つを 2 つの下流に登録する（本PoCの `PROVISIONING_API_ADMIN_CLIENTS` と aka-only-server の `AKA_ADMIN_CLIENTS` に同じフィンガープリントを登録する）。`eapaka-provisioner gen-client-cert -name <識別名>` で作る（BFF の `gen-client-cert` と同じ使い方。標準エラーに両方の `.env` に貼れる行を出す）。
+- 導入時の確認用に `eapaka-provisioner check-downstream`（下流 2 つの `/status` と AVクライアントを確かめる）を用意する。起動時にも同じ確認をしてログに出す。接続できなくても provisioner は起動する。
+- 加入者の作成は、存在確認を含めて下流を最大 5 回呼ぶ。BFF から呼ぶときは、BFF 側の呼び出しのタイムアウト（現状 10 秒）を provisioner の最大の処理時間より長くする（BFF の付け替えの作業で行う）。
+
+## 12. 配置（Docker Compose）
+
+| 構成 | 内容 |
+|---|---|
+| `compose.yaml` | provisioner と専用 Valkey。BFF 向けの共有ネットワーク（既定名 `eapaka-provisioner`、変数 `PROVISIONER_SHARED_NETWORK`）を作り、provisioner だけを参加させる。ポートの公開は `${PROVISIONER_BIND:-127.0.0.1}:9446` |
+| `compose.eapaka-prov.yaml` | 本PoCと同一ホストのとき重ねる。external の `eapaka-prov` に provisioner を参加させる |
+| `compose.aka-av.yaml` | aka-only-server と同一ホストのとき重ねる。external の `aka-av` に provisioner を参加させる |
+
+- 重ねるファイルは `.env` の `COMPOSE_FILE` で選ぶ（BFF と同じ）。下流ごとに同一ホスト・別ホストを選べる。
+- 同一ホストの下流は先に起動しておく（共有ネットワークがないと provisioner は起動できない）。
+- 別ホストの下流には、VPN のアドレスで接続する（下流のサーバー証明書の SAN にそのアドレスを入れる）。
+- 専用 Valkey は共有ネットワークに参加させない。
+
+使用中のポート: aka-only-server 8443（AV）・9443（管理）、provisioning-api 9444、aka 版 GUI 8444、BFF 8445、provisioner 9446。
+
+## 13. 試験
+
+- **単体テスト:** 下流を `httptest` の偽物にして、各手順での失敗（接続できない、409、400、5xx）を注入し、補償・やり直し・応答を確かめる。Valkey を使う部分は、接続先を環境変数で指定したときだけ実際の Valkey で試す。
+- **契約テスト:** 下流の接続先を環境変数で指定したときだけ実行する。テスト用の IMSI（`00101...`）・IP（`198.51.100.0/24` 等）を作り、最後に消す。
+- **CI（GitHub Actions）:** 本PoC と aka-only-server を固定のコミット（`POC_REF` / `AKA_REF`）で checkout してビルドし、契約テストの相手にする。
+- **起動しての確認:** 手元（WSL）では下流をバイナリと専用の Valkey コンテナで起動して通しで確かめる。simwifi では、同一ホスト（共有ネットワーク）と別ホスト（Tailscale のアドレス）で、BFF なしで curl から操作し、`aka` の加入者は eapaka_test で認証まで確かめる。
+
+## 14. 将来拡張
+
+| 項目 | 内容 | 前提・注意 |
+|---|---|---|
+| 一覧の改善 | 正確な `total`、属性（置き場所、`issues` 等）での検索、下流が持たない付加情報（ラベル、メモ等） | 加入者の台帳（置き場所や付加情報の記録）を provisioner の Valkey に持つ必要がある。下流が正本のままなので、Admin TUI 等での直接の変更による台帳とのずれの検出と、どちらを正とするかの規則がセットで要る |
+| 時間のかかるジョブ | 置き場所の移行（PLMN 単位で `poc` と `aka` の間で鍵を移す）、大量の登録・削除 | 操作の記録（§9.3）を、進み具合を残して途中から再開できるジョブに広げる。鍵の移行では Ki / OPc を一時的に扱うため、保存の方法を別に決める |
+| 整合性の定期確認 | 全加入者の `issues` を定期的に調べて保存し、一覧で返す | 一覧の改善と合わせて検討する |
+| 複数ノード | 本PoC・aka-only-server を複数扱う | 加入者をどのノードに置くかの決め方（設定、全ノードへの問い合わせ、台帳）を決める |
+| AVクライアントの管理 | aka の AVクライアントの登録・変更の中継 | 現状は aka 版 GUI で行う |
+| 下流の条件つきの書き込み | ETag と `If-Match` で、provisioner の外からの変更との競合を検出する | 下流 2 つの API の変更が要る |
+| 操作者ごとの権限 | 管理クライアントごとの読み取り専用等 | 下流と合わせて検討する |
+
+## 15. 設計の途中で見つかった事項
+
+いずれも 2026-10-10 に決定。
+
+| # | 内容 | 決定 |
+|---|---|---|
+| 1 | aka-only-server の管理API は `X-Trace-ID` を受け取らず、監査ログにも残さない（2026-10-10 に確認）。provisioner の操作と aka の監査ログを突き合わせる手がかりが、操作者と時刻だけになる | aka-only-server の管理API に、prov と同じ作法の `X-Trace-ID`（受け取り・採番・応答で返す・ログと監査ログの `traceId`）を加える。OpenAPI・実装・テストと aka 版 GUI のクライアントもあわせて直す。provisioner の API 仕様の作成より前に行う（未実施） |
+| 2 | PLMN マップで `01` に当たる aka 側の加入者を、他の AVクライアントと共有している場合の削除 | provisioner はそれらを本PoCの加入者として扱い、削除では aka 側の加入者ごと削除する（他の AVクライアントとは共有しない前提）。共有が要る場合は、削除で自分の AVクライアントID を外すだけにする案に切り替える |
+
+## 16. 実装ステップ
+
+各ステップの終わりに「作ったもの」と「実際に動かして確かめたこと」を報告して確認をもらう。
+
+1. API 仕様（`docs/openapi/provisioner-api.yaml`）の作成
+2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose
+3. 下流のクライアント（prov / aka。diagnose を含む）と契約テスト、CI
+4. 中継する操作（§7）、ロック、`Idempotency-Key`、監査ログ
+5. 加入者の統合操作（§6）と操作の記録・要求の中の補償
+6. やり直しのワーカーと `/operations`
+7. 運用ガイド・README、simwifi での確認（同一ホスト・別ホスト、eapaka_test での認証）
+
+BFF（web-gui-for-eapaka-radius）の provisioner への付け替えは、この後に BFF のリポジトリで行う。

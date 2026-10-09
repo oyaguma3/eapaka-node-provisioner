@@ -1,0 +1,31 @@
+# 検証用の環境の情報などを含むので公開しない
+CLAUDE.md
+
+# ローカルのパスを含むので共有しない
+.claude/settings.json
+
+# 環境変数（機密情報）。.env.example は管理する
+.env
+
+# 証明書・秘密鍵
+*.pem
+*.key
+/certs/
+
+# リポジトリ直下で go build したときの成果物
+/eapaka-node-provisioner
+
+# テストとカバレッジ
+*.test
+*.out
+coverage.*
+!coverage.go
+*.coverprofile
+
+# Go Workspace（単一の module で使う想定）
+go.work
+go.work.sum
+
+# エディター
+*.swp
+*~
