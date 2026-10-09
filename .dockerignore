@@ -1,0 +1,9 @@
+.git
+.github
+.claude
+.env
+*.pem
+*.key
+certs
+docs
+CLAUDE.md

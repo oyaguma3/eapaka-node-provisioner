@@ -1,0 +1,13 @@
+# aka-only-server と同じホストで動かすときに重ねる設定。
+# aka-only-server の compose が作る共有ネットワーク（既定の名前は aka-av）に provisioner だけを参加させ、
+# ホスト名 aka-only-server で管理API に接続する。provisioner 専用の Valkey は参加させない。
+# aka-only-server を先に起動する。.env の COMPOSE_FILE に加えると有効になる。
+services:
+  eapaka-provisioner:
+    networks:
+      - aka-av
+
+networks:
+  aka-av:
+    external: true
+    name: ${AKA_SHARED_NETWORK:-aka-av}

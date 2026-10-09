@@ -1,0 +1,71 @@
+services:
+  eapaka-provisioner:
+    build:
+      context: .
+      args:
+        VERSION: ${PROVISIONER_VERSION:-dev}
+    restart: unless-stopped
+    depends_on:
+      valkey:
+        condition: service_healthy
+    environment:
+      PROVISIONER_ADDR: ":9446"
+      PROVISIONER_TLS_CERT: ${PROVISIONER_TLS_CERT:-/data/tls/cert.pem}
+      PROVISIONER_TLS_KEY: ${PROVISIONER_TLS_KEY:-/data/tls/key.pem}
+      PROVISIONER_TLS_HOSTS: ${PROVISIONER_TLS_HOSTS:-localhost,127.0.0.1,eapaka-provisioner}
+      PROVISIONER_ADMIN_CLIENTS: ${PROVISIONER_ADMIN_CLIENTS:-}
+      PROVISIONER_CLIENT_CERT: /certs/client.pem
+      PROVISIONER_CLIENT_KEY: ${PROVISIONER_CLIENT_KEY:-}
+      PROVISIONER_PROV_URL: ${PROVISIONER_PROV_URL:-https://provisioning-api:9444/admin/v1}
+      PROVISIONER_PROV_SERVER_CERT: /certs/prov-server.pem
+      PROVISIONER_AKA_URL: ${PROVISIONER_AKA_URL:-}
+      PROVISIONER_AKA_SERVER_CERT: /certs/aka-server.pem
+      PROVISIONER_AKA_AV_CLIENT_ID: ${PROVISIONER_AKA_AV_CLIENT_ID:-}
+      PROVISIONER_PLMN_MAP: ${PROVISIONER_PLMN_MAP:-}
+      PROVISIONER_DOWNSTREAM_TIMEOUT: ${PROVISIONER_DOWNSTREAM_TIMEOUT:-5s}
+      PROVISIONER_VALKEY_ADDR: valkey:6379
+      PROVISIONER_VALKEY_PASSWORD: ${PROVISIONER_VALKEY_PASSWORD:?.env に PROVISIONER_VALKEY_PASSWORD を設定してください}
+      PROVISIONER_AUDIT_MAX: ${PROVISIONER_AUDIT_MAX:-10000}
+      PROVISIONER_LOG_LEVEL: ${PROVISIONER_LOG_LEVEL:-info}
+    volumes:
+      # 自動生成したサーバー証明書を保存する。
+      - provisioner-data:/data
+      # 下流用の証明書（client.pem: gen-client-cert で作った provisioner のクライアント証明書と秘密鍵、
+      # prov-server.pem: 本PoCの provisioning-api のサーバー証明書、aka-server.pem: aka-only-server の管理API のサーバー証明書）と、
+      # 持ち込みのサーバー証明書を置く。コンテナは UID 65532 で動くので、ファイルはこの UID で読めるようにする。
+      - ./certs:/certs:ro
+    ports:
+      # Docker が公開したポートは ufw の規則を通らない。公開範囲はここのバインド先（VPN 側のアドレス）で制御する。
+      - "${PROVISIONER_PUBLISH:-127.0.0.1:9446}:9446"
+    networks:
+      - default
+      # 同一ホストの管理クライアント（BFF など）は、この共有ネットワークに参加して https://eapaka-provisioner:9446 で接続する。
+      - shared
+
+  valkey:
+    image: valkey/valkey:9
+    restart: unless-stopped
+    # 操作の記録・ロック・Idempotency-Key・監査ログを保存する（provisioner 専用。下流の Valkey とは別）。
+    # 操作の記録は補償・やり直しに使うので、AOF は書き込みごとに同期する。
+    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "always", "--requirepass", "${PROVISIONER_VALKEY_PASSWORD}"]
+    environment:
+      VALKEY_PASSWORD: ${PROVISIONER_VALKEY_PASSWORD:?.env に PROVISIONER_VALKEY_PASSWORD を設定してください}
+    volumes:
+      - valkey-data:/data
+    # 共有ネットワークには参加させない。
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a \"$$VALKEY_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  default:
+  shared:
+    name: ${PROVISIONER_SHARED_NETWORK:-eapaka-provisioner}
+
+volumes:
+  provisioner-data:
+  valkey-data:

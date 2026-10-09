@@ -1,6 +1,6 @@
 # eapaka-node-provisioner 設計概要
 
-- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は未着手。
+- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は §16 のステップ 2（骨組み）まで。
 - 対象: 統合API（コマンド名 `eapaka-provisioner`。以下「provisioner」）。
 - 関連:
   - 本PoC（eapaka-radius-server-poc）の Provisioning API: `docs/D-13_Provisioning_API詳細設計書_r*.md`、`docs/openapi/provisioning-api.yaml`
@@ -155,7 +155,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 | `audit` | Stream | provisioner の監査ログ（§10.2）。件数の上限つき |
 
 - 秘密の値（Ki / OPc、共有シークレット）は保存しない。`op:` には変更前のポリシー（秘密の値を含まない）だけを残す。`idem:` に残す応答は書き込みの応答で、秘密の値を含まない。要求は本文を保存せず、ハッシュ（SHA-256）だけを残す。
-- AOF を有効にして `appendfsync always` とする。ポートは公開せず、`requirepass` を設定する（aka-only-server・BFF と同じ）。
+- AOF を有効にして `appendfsync always` とする（aka-only-server と同じ。操作の記録を補償・やり直しに使うため、BFF の `everysec` より強くする）。ポートは公開せず、`requirepass` を設定する。
 - Valkey に接続できないとき、書き込み（ロックと操作の記録が要る）は 500（`SYSTEM_FAILURE`。下流と同じく Valkey のエラーは 500）で断り、下流は呼ばない。読み取りは続けて行う。
 
 ## 9. 排他・再送・操作の記録
@@ -224,9 +224,9 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 | `PROVISIONER_ADDR` | 待ち受け | `:9446` |
 | `PROVISIONER_TLS_CERT` / `_TLS_KEY` / `_TLS_HOSTS` | サーバー証明書・秘密鍵（なければ生成）、生成時の SAN | `/data/tls/...`、`localhost,127.0.0.1,eapaka-provisioner` |
 | `PROVISIONER_ADMIN_CLIENTS` | 管理クライアント（`識別名=フィンガープリント,...`）。空なら起動しない | — |
-| `PROVISIONER_CLIENT_CERT` / `_CLIENT_KEY` | 下流 2 つに使うクライアント証明書と秘密鍵 | — |
-| `PROVISIONER_PROV_URL` / `_PROV_SERVER_CERT` | prov のベースURL、検証に使うサーバー証明書 | `https://provisioning-api:9444/admin/v1` |
-| `PROVISIONER_AKA_URL` / `_AKA_SERVER_CERT` | aka のベースURL、検証に使うサーバー証明書。URL が空なら `aka` を扱わない | （空） |
+| `PROVISIONER_CLIENT_CERT` / `_CLIENT_KEY` | 下流 2 つに使うクライアント証明書と秘密鍵（鍵が空なら証明書のファイルから読む） | `/certs/client.pem`、（空） |
+| `PROVISIONER_PROV_URL` / `_PROV_SERVER_CERT` | prov のベースURL、検証に使うサーバー証明書 | `https://provisioning-api:9444/admin/v1`、`/certs/prov-server.pem` |
+| `PROVISIONER_AKA_URL` / `_AKA_SERVER_CERT` | aka のベースURL、検証に使うサーバー証明書。URL が空なら `aka` を扱わない | （空）、`/certs/aka-server.pem` |
 | `PROVISIONER_PLMN_MAP` | PLMN マップ（§4） | （空。すべて `poc`） |
 | `PROVISIONER_AKA_AV_CLIENT_ID` | vector-gateway の AVクライアントID（§5）。aka を使うなら必須 | — |
 | `PROVISIONER_DOWNSTREAM_TIMEOUT` | 下流の 1 回の呼び出しのタイムアウト | `5s` |
@@ -235,7 +235,8 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 | `PROVISIONER_LOG_LEVEL` | ログの水準 | `info` |
 
 - 下流のクライアント証明書は 1 つを 2 つの下流に登録する（本PoCの `PROVISIONING_API_ADMIN_CLIENTS` と aka-only-server の `AKA_ADMIN_CLIENTS` に同じフィンガープリントを登録する）。`eapaka-provisioner gen-client-cert -name <識別名>` で作る（BFF の `gen-client-cert` と同じ使い方。標準エラーに両方の `.env` に貼れる行を出す）。
-- 導入時の確認用に `eapaka-provisioner check-downstream`（下流 2 つの `/status` と AVクライアントを確かめる）を用意する。起動時にも同じ確認をしてログに出す。接続できなくても provisioner は起動する。
+- 導入時の確認用に `eapaka-provisioner check-downstream`（下流 2 つの `/status` と AVクライアントを確かめる）を用意する。起動時にも同じ確認をしてログに出す。接続できなくても provisioner は起動する（Valkey には接続できないと起動しない）。
+- 設定の組み合わせの誤り（PLMN マップに `01` があるのに `PROVISIONER_AKA_URL` が空、`PROVISIONER_AKA_URL` があるのに `PROVISIONER_AKA_AV_CLIENT_ID` が空など）は、起動時にエラーにする。本PoCの vector-gateway を passthrough モードで動かしている場合は、PLMN マップを空にする。
 - 加入者の作成は、存在確認を含めて下流を最大 5 回呼ぶ。BFF から呼ぶときは、BFF 側の呼び出しのタイムアウト（現状 10 秒）を provisioner の最大の処理時間より長くする（BFF の付け替えの作業で行う）。
 
 ## 12. 配置（Docker Compose）
@@ -286,7 +287,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 各ステップの終わりに「作ったもの」と「実際に動かして確かめたこと」を報告して確認をもらう。
 
 1. API 仕様（`docs/openapi/provisioner-api.yaml`）の作成 … 作成済み（0.1.0。2026-10-10）
-2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose
+2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose … 実装済み（2026-10-10）。下流のクライアントは、接続の仕組み（`internal/downstream`）と `/status` に要る呼び出し（両方の状態、aka の AVクライアント）まで。手元と simwifi（同一ホスト）で確認済み
 3. 下流のクライアント（prov / aka。diagnose を含む）と契約テスト、CI
 4. 中継する操作（§7）、ロック、`Idempotency-Key`、監査ログ
 5. 加入者の統合操作（§6）と操作の記録・要求の中の補償
