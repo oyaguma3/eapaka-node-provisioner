@@ -16,21 +16,28 @@ import (
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/plmn"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/store"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/trace"
 )
 
 // basePath は API のパスの接頭辞。
 const basePath = "/admin/v1"
 
+// Relayer は下流に要求をそのまま中継する操作。*downstream.Client が満たす。
+type Relayer interface {
+	BaseURL() string
+	Relay(ctx context.Context, req downstream.RelayRequest) (downstream.RelayResponse, error)
+}
+
 // ProvAPI は provisioner が使う provisioning-api の操作。*provapi.Client が満たす。
 type ProvAPI interface {
-	BaseURL() string
+	Relayer
 	Status(ctx context.Context) (provapi.Status, error)
 }
 
 // AkaAPI は provisioner が使う aka-only-server の管理API の操作。*akaapi.Client が満たす。
 type AkaAPI interface {
-	BaseURL() string
+	Relayer
 	Status(ctx context.Context) (akaapi.Status, error)
 	GetAVClient(ctx context.Context, id int64) (akaapi.AVClient, error)
 }
@@ -38,6 +45,16 @@ type AkaAPI interface {
 // Store は provisioner 専用の Valkey の操作。*store.Store が満たす。
 type Store interface {
 	Ping(ctx context.Context) error
+
+	AppendAudit(ctx context.Context, e store.AuditEntry, maxLen int64) error
+	ListAudit(ctx context.Context, before string, limit int) ([]store.AuditEntry, string, error)
+
+	AcquireIMSILock(ctx context.Context, imsi string, ttl time.Duration) (token string, err error)
+	ReleaseIMSILock(ctx context.Context, imsi, token string) error
+
+	BeginIdempotent(ctx context.Context, mgmtClient, key, reqHash string, pendingTTL time.Duration) (store.IdempotencyState, store.StoredResponse, error)
+	CompleteIdempotent(ctx context.Context, mgmtClient, key, reqHash string, resp store.StoredResponse, ttl time.Duration) error
+	AbandonIdempotent(ctx context.Context, mgmtClient, key, reqHash string) error
 }
 
 // Handler は API のハンドラー。
@@ -55,15 +72,37 @@ type Handler struct {
 	Store         Store
 	// DownstreamTimeout は、状態の確認で下流を呼ぶときの上限時間。
 	DownstreamTimeout time.Duration
+	// AuditMaxLen は監査ログの保持件数の上限。
+	AuditMaxLen int64
 
 	Version   string
 	StartedAt time.Time
 }
 
-// Routes は API のルーティングを返す。
+// Routes は API のルーティングを返す。書き込みは idempotent で Idempotency-Key を扱う。
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+basePath+"/status", h.getStatus)
+	mux.HandleFunc("GET "+basePath+"/audit-logs", h.listAuditLogs)
+
+	// 中継（prov）。
+	mux.HandleFunc("GET "+basePath+"/clients", h.relayClients)
+	mux.HandleFunc("POST "+basePath+"/clients", h.idempotent(h.relayClients))
+	mux.HandleFunc("GET "+basePath+"/clients/{clientId}", h.relayClient)
+	mux.HandleFunc("PATCH "+basePath+"/clients/{clientId}", h.idempotent(h.relayClient))
+	mux.HandleFunc("DELETE "+basePath+"/clients/{clientId}", h.idempotent(h.relayClient))
+	mux.HandleFunc("GET "+basePath+"/clients/{clientId}/secret", h.relayClientSecret)
+	mux.HandleFunc("GET "+basePath+"/policies", h.relayPolicies)
+	mux.HandleFunc("GET "+basePath+"/policies/{imsi}", h.relayPolicy)
+	mux.HandleFunc("PUT "+basePath+"/policies/{imsi}", h.idempotent(h.relayPolicy))
+	mux.HandleFunc("DELETE "+basePath+"/policies/{imsi}", h.idempotent(h.relayPolicy))
+	mux.HandleFunc("GET "+basePath+"/sessions", h.relaySessions)
+	mux.HandleFunc("GET "+basePath+"/prov/audit-logs", h.relayProvAuditLogs)
+
+	// 中継（aka。読み取りだけ）。
+	mux.HandleFunc("GET "+basePath+"/aka/audit-logs", h.relayAkaAuditLogs)
+	mux.HandleFunc("GET "+basePath+"/aka/av-clients/{clientId}", h.relayAkaAVClient)
+
 	return h.observe(checkOperator(withFallback(mux)))
 }
 

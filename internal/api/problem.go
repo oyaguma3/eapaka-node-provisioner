@@ -7,7 +7,16 @@ import (
 
 // ProblemDetails の cause の値（docs/openapi/provisioner-api.yaml の ProblemDetails）。
 const (
-	causeOptionalIEIncorrect = "OPTIONAL_IE_INCORRECT"
+	causeInvalidMsgFormat        = "INVALID_MSG_FORMAT"
+	causeInvalidQueryParam       = "INVALID_QUERY_PARAM"
+	causeMandatoryIEIncorrect    = "MANDATORY_IE_INCORRECT"
+	causeOptionalIEIncorrect     = "OPTIONAL_IE_INCORRECT"
+	causeSystemFailure           = "SYSTEM_FAILURE"
+	causeOperationInProgress     = "OPERATION_IN_PROGRESS"
+	causeIdempotencyKeyMismatch  = "IDEMPOTENCY_KEY_MISMATCH"
+	causeDownstreamError         = "DOWNSTREAM_ERROR"
+	causeDownstreamUnavailable   = "DOWNSTREAM_UNAVAILABLE"
+	causeDownstreamNotConfigured = "DOWNSTREAM_NOT_CONFIGURED"
 )
 
 type invalidParam struct {
@@ -45,6 +54,12 @@ func (p *problem) write(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(p.Status)
 	json.MarshalWrite(w, p)
+}
+
+// internalError は内部エラー（Valkey のエラー等）を記録し、詳細を伏せた 500 を返す。
+func (h *Handler) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	h.Log.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+	newProblem(http.StatusInternalServerError, causeSystemFailure, "").write(w)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

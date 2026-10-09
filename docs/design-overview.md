@@ -1,6 +1,6 @@
 # eapaka-node-provisioner 設計概要
 
-- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は §16 のステップ 3（下流のクライアント、契約テスト、CI）まで。
+- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は §16 のステップ 4（中継、ロック、Idempotency-Key、監査ログ）まで。
 - 対象: 統合API（コマンド名 `eapaka-provisioner`。以下「provisioner」）。
 - 関連:
   - 本PoC（eapaka-radius-server-poc）の Provisioning API: `docs/D-13_Provisioning_API詳細設計書_r*.md`、`docs/openapi/provisioning-api.yaml`
@@ -173,6 +173,9 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 - 同じ管理クライアントから同じキーで届いた要求は、24 時間のあいだ、最初の応答をそのまま返す（下流は呼ばない）。返したことは応答ヘッダー `Idempotent-Replayed: true` で示す。
 - 最初の要求がまだ処理中なら 409（`OPERATION_IN_PROGRESS`）、同じキーで要求の内容（メソッド・パス・本文）が違えば 422（`IDEMPOTENCY_KEY_MISMATCH`）。
 - ヘッダーがなければ判定しない（従来どおり、作成のやり直しは 409 で分かる）。
+- 応答を覚えるのは 4xx までとする。5xx（下流に接続できない等）は覚えずに消し、同じキーでやり直せるようにする。同じ IMSI の操作が処理中の 409（`OPERATION_IN_PROGRESS`）も一時的なので覚えない。
+- 処理中の記録の有効期限は、ロックと同じ 60 秒とする（プロセスが落ちて処理中のまま残っても、その時間が過ぎればやり直せる）。完了したら 24 時間に延ばす。
+- 同じ要求かどうかは、メソッド・パス（エスケープしたもの）・クエリ・本文のハッシュで比べる。
 
 ### 9.3 操作の記録と補償
 
@@ -210,6 +213,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 - 監査ログの項目: `id`、`time`、`operator`、`mgmtClient`、`action`、`target`、`traceId`、`operationId`、`result`（`completed` / `rolled_back` / `retrying` / `failed` / `dismissed`）、`details`（下流ごとの結果。秘密の値は含まない）。`action` は下流と同じ命名（`subscriber.create` 等）に、`operation.resume`（自動のやり直しの結果。操作者と管理クライアントは空）、`operation.retry`、`operation.dismiss` を加える。
 - 記録するのは、変更操作が成功したとき、加入者の作成・変更・削除で下流への書き込みを始めた後に失敗したとき、秘密の値を取得したとき。書き込む前に断った要求（入力の誤り、409 等）は監査ログに残さない（アプリケーションログには残る）。
 - 秘密の値の取得（`/subscribers/{imsi}/keys`、`/clients/{clientId}/secret`）も、そのたびに監査ログに残す（値は残さない）。
+- 中継した操作の `details` は、下流の名前（`downstream`）と、変更なら変えた項目の名前（`fields`）だけとする。中継の本文は検証しない方針で、秘密の値を含みうるため、値は残さない（変更前後の値は下流の監査ログにある）。RADIUSクライアントの作成の `target` は、下流が採番した ID。
 
 ### 10.3 アプリケーションログ
 
@@ -290,7 +294,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 1. API 仕様（`docs/openapi/provisioner-api.yaml`）の作成 … 作成済み（0.1.0。2026-10-10）
 2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose … 実装済み（2026-10-10）。手元と simwifi（同一ホスト）で確認済み
 3. 下流のクライアント（prov / aka。diagnose を含む）と契約テスト、CI … 実装済み（2026-10-10）。型つきの呼び出しは加入者の統合操作で使うもの（prov の加入者・認可ポリシー、aka の加入者・AVクライアント）。中継（RADIUSクライアント、セッション、監査ログ）は要求と応答をそのまま渡す `Relay` で行う
-4. 中継する操作（§7）、ロック、`Idempotency-Key`、監査ログ
+4. 中継する操作（§7）、ロック、`Idempotency-Key`、監査ログ … 実装済み（2026-10-10）。手元で下流をバイナリで起動して確認済み
 5. 加入者の統合操作（§6）と操作の記録・要求の中の補償
 6. やり直しのワーカーと `/operations`
 7. 運用ガイド・README、simwifi での確認（同一ホスト・別ホスト、eapaka_test での認証）

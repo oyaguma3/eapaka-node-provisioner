@@ -136,6 +136,7 @@ func serve(ctx context.Context) error {
 		PLMNMap:           cfg.PLMNMap,
 		Store:             st,
 		DownstreamTimeout: cfg.DownstreamTimeout,
+		AuditMaxLen:       cfg.AuditMaxLen,
 		Version:           version,
 		StartedAt:         time.Now().UTC(),
 	}
