@@ -27,6 +27,8 @@ type SubscriberService interface {
 	Create(ctx context.Context, a subscriber.Actor, in subscriber.CreateInput) (subscriber.Subscriber, subscriber.Result, error)
 	Update(ctx context.Context, a subscriber.Actor, imsi string, in subscriber.UpdateInput) (subscriber.Subscriber, subscriber.Result, error)
 	Delete(ctx context.Context, a subscriber.Actor, imsi string) (subscriber.Result, error)
+	// CheckUnresolved は、同じ IMSI に未完了の操作があれば *subscriber.UnresolvedError を返す（ポリシーの PUT・DELETE で使う）。
+	CheckUnresolved(ctx context.Context, imsi string) error
 
 	Operations(ctx context.Context, status string, limit int) ([]store.Operation, int, error)
 	Operation(ctx context.Context, id string) (store.Operation, error)
@@ -370,6 +372,10 @@ func (h *Handler) subscriberError(w http.ResponseWriter, r *http.Request, err er
 		newProblem(http.StatusConflict, causeOperationInProgress, "another operation on the same IMSI is in progress").write(w)
 		return
 	}
+	if ue, ok := errors.AsType[*subscriber.UnresolvedError](err); ok {
+		writeUnresolved(w, r, ue)
+		return
+	}
 	if errors.Is(err, subscriber.ErrNotFound) {
 		newProblem(http.StatusNotFound, causeUserNotFound, "").write(w)
 		return
@@ -400,6 +406,16 @@ func (h *Handler) subscriberError(w http.ResponseWriter, r *http.Request, err er
 			p.Detail = "the operation did not complete and will be retried; see /operations/" + oe.OperationID
 		}
 	}
+	p.write(w)
+}
+
+// writeUnresolved は、同じ IMSI に未完了の操作があるため断ったことを 409 で返す（設計概要 §9.3）。
+// その操作を retry か dismiss で片付ければ同じ要求が通るので、Idempotency-Key では覚えない。
+func writeUnresolved(w http.ResponseWriter, r *http.Request, ue *subscriber.UnresolvedError) {
+	doNotRemember(r)
+	p := newProblem(http.StatusConflict, causeOperationUnresolved,
+		"an unresolved operation ("+ue.Status+") remains on the same IMSI; retry or dismiss it first: /operations/"+ue.OperationID)
+	p.OperationID = ue.OperationID
 	p.write(w)
 }
 

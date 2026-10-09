@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: eapaka-node-provisioner API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     EAP-AKA RADIUS PoC（以下「本PoC」）の Provisioning API（以下「prov」）と、aka-only-server の管理API（以下「aka」）を
     組み合わせて操作する統合API。設計は `docs/design-overview.md` を参照。
@@ -42,6 +42,9 @@ info:
     排他:
     - 加入者の作成・変更・削除と、認可ポリシーの PUT・DELETE は、IMSI ごとに排他する。同じ IMSI の操作が処理中なら、
       待たずに 409（`OPERATION_IN_PROGRESS`）を返す。
+    - 同じ IMSI に未完了（`running` / `retrying` / `failed`）の操作の記録があれば、加入者の作成・変更・削除と、
+      認可ポリシーの PUT・DELETE を 409（`OPERATION_UNRESOLVED`。`operationId` 付き）で断る。古い操作の続き（補償・やり直し）が
+      新しい操作の結果を消さないようにするため。その操作を `retry` か `dismiss` で片付けてから送り直す。
     - 排他は provisioner を通る操作どうしでだけ効く。本PoCの Admin TUI、aka 版 GUI、下流の API を直接呼ぶ操作とは排他できない。
 
     監査ログ:
@@ -674,6 +677,7 @@ paths:
       operationId: putPolicy
       description: |
         prov の `PUT /policies/{imsi}` を中継する。加入者の操作と同じ IMSI のロックを取る（処理中なら 409 `OPERATION_IN_PROGRESS`）。
+        同じ IMSI に未完了の操作の記録があれば 409（`OPERATION_UNRESOLVED`）。
         加入者（鍵）の有無は確認しない。`Location`（201）は provisioner のパスで返す。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -712,7 +716,9 @@ paths:
       tags: [policies]
       summary: 認可ポリシーを削除する（prov の中継）
       operationId: deletePolicy
-      description: 加入者の操作と同じ IMSI のロックを取る（処理中なら 409 `OPERATION_IN_PROGRESS`）。
+      description: |
+        加入者の操作と同じ IMSI のロックを取る（処理中なら 409 `OPERATION_IN_PROGRESS`）。
+        同じ IMSI に未完了の操作の記録があれば 409（`OPERATION_UNRESOLVED`）。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -936,6 +942,7 @@ components:
       description: |
         再送の判定に使うキー（印字可能ASCII 1〜128文字）。同じ管理クライアントから同じキーで届いた要求には、
         24 時間のあいだ最初の応答を返す。形式が違えば 400（`OPTIONAL_IE_INCORRECT`）。
+        5xx と、一時的な 409（`OPERATION_IN_PROGRESS`、`OPERATION_UNRESOLVED`）の応答は覚えない（同じキーで送り直せる）。
       schema:
         type: string
         pattern: '^[\x21-\x7E]{1,128}$'
@@ -982,12 +989,16 @@ components:
         - `SUBSCRIBER_ALREADY_EXISTS`: 同じ IMSI のものが既にある。`conflicts` にある場所を入れる
           （書き込みの途中で下流が 409 を返した場合は、補償したうえで `operationId` と `rolledBack` も付ける）。
         - `OPERATION_IN_PROGRESS`: 同じ IMSI の操作、または同じ `Idempotency-Key` の要求が処理中。
+        - `OPERATION_UNRESOLVED`: 同じ IMSI に未完了の操作の記録がある。`operationId` にその操作の ID を入れる。
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
     OperationInProgress:
-      description: 同じ IMSI の操作、または同じ `Idempotency-Key` の要求が処理中。`cause` は `OPERATION_IN_PROGRESS`。
+      description: |
+        次のどちらか。
+        - `OPERATION_IN_PROGRESS`: 同じ IMSI の操作、または同じ `Idempotency-Key` の要求が処理中。
+        - `OPERATION_UNRESOLVED`: 同じ IMSI に未完了の操作の記録がある。`operationId` にその操作の ID を入れる。
       content:
         application/problem+json:
           schema:
@@ -1055,7 +1066,8 @@ components:
         中継のエラー。
         - 下流が返したエラー（ProblemDetails）は、ステータスと本文をそのまま返す（`downstream` を加える）。
         - 下流に接続できない場合は 503（`DOWNSTREAM_UNAVAILABLE`）、ProblemDetails でない応答は 502（`DOWNSTREAM_ERROR`）。
-        - `/policies/{imsi}` の PUT / DELETE で同じ IMSI の操作が処理中なら 409（`OPERATION_IN_PROGRESS`）。
+        - `/policies/{imsi}` の PUT / DELETE で同じ IMSI の操作が処理中なら 409（`OPERATION_IN_PROGRESS`）、
+          同じ IMSI に未完了の操作の記録があれば 409（`OPERATION_UNRESOLVED`。`operationId` 付き）。
         - `Idempotency-Key` の判定は 409（`OPERATION_IN_PROGRESS`）/ 422（`IDEMPOTENCY_KEY_MISMATCH`）。
         - aka を設定していない場合の `/aka/...` は 404（`DOWNSTREAM_NOT_CONFIGURED`）。
         - provisioner 内部のエラーは 500（`SYSTEM_FAILURE`）。
@@ -2042,6 +2054,7 @@ components:
             - SYSTEM_FAILURE
             - KEY_STORE_MISMATCH
             - OPERATION_IN_PROGRESS
+            - OPERATION_UNRESOLVED
             - IDEMPOTENCY_KEY_MISMATCH
             - OPERATION_NOT_FOUND
             - OPERATION_STATE_CONFLICT
@@ -2067,7 +2080,9 @@ components:
         operationId:
           allOf:
             - $ref: '#/components/schemas/OperationId'
-          description: 操作の記録の ID（加入者の作成・変更・削除で、下流への書き込みを始めた後に失敗した場合）。
+          description: |
+            操作の記録の ID。加入者の作成・変更・削除で、下流への書き込みを始めた後に失敗した場合はその操作。
+            `OPERATION_UNRESOLVED` では、同じ IMSI の未完了の操作。
         rolledBack:
           type: boolean
           description: 補償で元に戻したか（`operationId` を返す場合だけ）。

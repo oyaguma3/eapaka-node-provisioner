@@ -1,13 +1,13 @@
 # eapaka-node-provisioner 設計概要
 
-- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。実装は §16 のステップ 6（やり直しのワーカーと `/operations`）まで。
+- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。§16 のステップ 7（運用ガイド・README、simwifi での確認）まで完了。導入と運用の手順は `docs/operation-guide.md`。
 - 対象: 統合API（コマンド名 `eapaka-provisioner`。以下「provisioner」）。
 - 関連:
   - 本PoC（eapaka-radius-server-poc）の Provisioning API: `docs/D-13_Provisioning_API詳細設計書_r*.md`、`docs/openapi/provisioning-api.yaml`
   - aka-only-server の管理API: `docs/design-overview.md`、`docs/openapi/admin-api.yaml`
   - Vector Gateway の接続方式と PLMN マップ: 本PoCの `docs/D-12_Vector_Gateway_詳細設計書_r*.md`
   - 手本にする実装: web-gui-for-eapaka-radius（以下「BFF」）の `internal/provapi`、web-gui-for-aka-only-server の `internal/adminapi`
-- API の契約: `docs/openapi/provisioner-api.yaml`（0.1.0）。項目・エラーの詳細はそちらに書き、本書では方針を書く。
+- API の契約: `docs/openapi/provisioner-api.yaml`（0.2.0）。項目・エラーの詳細はそちらに書き、本書では方針を書く。
 
 ## 1. 位置づけ
 
@@ -175,7 +175,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 - 同じ管理クライアントから同じキーで届いた要求は、24 時間のあいだ、最初の応答をそのまま返す（下流は呼ばない）。返したことは応答ヘッダー `Idempotent-Replayed: true` で示す。
 - 最初の要求がまだ処理中なら 409（`OPERATION_IN_PROGRESS`）、同じキーで要求の内容（メソッド・パス・本文）が違えば 422（`IDEMPOTENCY_KEY_MISMATCH`）。
 - ヘッダーがなければ判定しない（従来どおり、作成のやり直しは 409 で分かる）。
-- 応答を覚えるのは 4xx までとする。5xx（下流に接続できない等）は覚えずに消し、同じキーでやり直せるようにする。同じ IMSI の操作が処理中の 409（`OPERATION_IN_PROGRESS`）も一時的なので覚えない。
+- 応答を覚えるのは 4xx までとする。5xx（下流に接続できない等）は覚えずに消し、同じキーでやり直せるようにする。同じ IMSI の操作が処理中の 409（`OPERATION_IN_PROGRESS`）と、同じ IMSI に未完了の操作がある 409（`OPERATION_UNRESOLVED`。§9.3）も一時的なので覚えない。
 - 処理中の記録の有効期限は、ロックと同じ 60 秒とする（プロセスが落ちて処理中のまま残っても、その時間が過ぎればやり直せる）。完了したら 24 時間に延ばす。
 - 同じ要求かどうかは、メソッド・パス（エスケープしたもの）・クエリ・本文のハッシュで比べる。
 
@@ -202,6 +202,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 - **ワーカーが下流に渡すもの:** 元の操作の操作者（`X-Operator-Id`）とトレースID（`X-Trace-ID`）を渡す。下流の監査ログでは、補償も元の操作と同じトレースID で突き合わせられる。
 - **鍵の変更が分からない変更:** 実行中のまま残った変更の記録で、鍵の手順が終わっておらず、その前のポリシーの手順が済んでいる（またはポリシーの手順がない）ものは、鍵の変更が反映されたかどうか分からない（変更前の Ki / OPc は残さないので戻せない）。ワーカーは自動では何もせず `failed` にして ERROR のログを出す（2026-10-10 決定）。手でのやり直し（`retry`）もできず（409）、人が下流の状態を確かめて直した後に `dismiss` で閉じる。ポリシーの手順が終わっていなければ、鍵には進んでいないので、ポリシーを変更前に戻す。
 - **プロセスが落ちたとき:** `running` のまま更新されない操作も、ロックの有効期限を過ぎればワーカーが拾って同じように処理する。下流を呼んだ後、記録を書く前に落ちた場合に備え、補償とやり直しは何度行っても結果が同じ操作（削除の 404 は成功とみなす、ポリシーの PUT）だけで組む。
+- **未完了の操作がある IMSI への新しい操作:** 同じ IMSI に未完了（`running` / `retrying` / `failed`）の記録があれば、加入者の作成・変更・削除と、ポリシーの PUT・DELETE を 409（`OPERATION_UNRESOLVED`。その操作の `operationId` 付き）で断り、下流は呼ばない（§15 の 3）。古い操作の続き（補償・やり直し）が、新しい操作の結果を消さないようにするため（例: 作成の補償が残ったまま作り直すと、作り直した加入者が補償で消される）。IMSI のロックを取った後に `ops:active` の記録を読んで確かめる（ロックの間は同じ IMSI の記録は増えず、ロックを持つ実行中の操作もないので、見つかる `running` は要求が落ちたもの）。未完了の操作は通常は少ないので、索引は設けずに全件を読む。`retry` と `dismiss`、ワーカーは対象外（片付けるための操作のため）。
 - **確認と手での対応:** `GET /operations`（`running` / `retrying` / `failed` の一覧）、`GET /operations/{opId}`（完了したものも保持期間のあいだ）、`POST /operations/{opId}/retry`（`failed` の続きをその場で 1 回行い、失敗すれば `retrying` に戻して自動のやり直しを再開する）、`POST /operations/{opId}/dismiss`（`retrying` / `failed` を手で直した後に `dismissed` にして閉じる）。どちらも IMSI のロックを取る。件数は `/status` にも出す。
 - **監査ログ:** ワーカーの処理は、結果が完了（`completed` / `rolled_back`）か `failed` になったときだけ `operation.resume` として残す（`retrying` のままの途中経過は残さない。操作者と管理クライアントは空、トレースID は元の操作のもの）。手での操作は `operation.retry` / `operation.dismiss` として、要求者つきで残す。監査ログを残す処理は `internal/audit` にまとめ、HTTP の要求とワーカーの両方が使う。
 - 操作の ID は UUID version 7（時刻順に並ぶ。Go の標準ライブラリで作れる）。
@@ -257,7 +258,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 
 | 構成 | 内容 |
 |---|---|
-| `compose.yaml` | provisioner と専用 Valkey。BFF 向けの共有ネットワーク（既定名 `eapaka-provisioner`、変数 `PROVISIONER_SHARED_NETWORK`）を作り、provisioner だけを参加させる。ポートの公開は `${PROVISIONER_BIND:-127.0.0.1}:9446` |
+| `compose.yaml` | provisioner と専用 Valkey。BFF 向けの共有ネットワーク（既定名 `eapaka-provisioner`、変数 `PROVISIONER_SHARED_NETWORK`）を作り、provisioner だけを参加させる。ポートの公開は `${PROVISIONER_PUBLISH:-127.0.0.1:9446}` |
 | `compose.eapaka-prov.yaml` | 本PoCと同一ホストのとき重ねる。external の `eapaka-prov` に provisioner を参加させる |
 | `compose.aka-av.yaml` | aka-only-server と同一ホストのとき重ねる。external の `aka-av` に provisioner を参加させる |
 
@@ -295,17 +296,18 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 |---|---|---|
 | 1 | aka-only-server の管理API は `X-Trace-ID` を受け取らず、監査ログにも残さない（2026-10-10 に確認）。provisioner の操作と aka の監査ログを突き合わせる手がかりが、操作者と時刻だけになる | aka-only-server の管理API に、prov と同じ作法の `X-Trace-ID`（受け取り・採番・応答で返す・ログと監査ログの `traceId`）を加える。OpenAPI・実装・テストと aka 版 GUI のクライアントもあわせて直す。provisioner の API 仕様の作成より前に行う。**実施済み（2026-10-10）**: aka-only-server 管理API 0.2.0（`2a6dcf8`）、aka 版 GUI（`b65d30a`）。認証ベクターAPI への追加は aka-only-server の今後の課題（同リポジトリの設計概要 §13.1） |
 | 2 | PLMN マップで `01` に当たる aka 側の加入者を、他の AVクライアントと共有している場合の削除 | provisioner はそれらを本PoCの加入者として扱い、削除では aka 側の加入者ごと削除する（他の AVクライアントとは共有しない前提）。共有が要る場合は、削除で自分の AVクライアントID を外すだけにする案に切り替える |
+| 3 | 加入者の作成・変更・削除が、同じ IMSI の未完了（retrying / failed）の操作の記録を見ていない。作成の補償が残ったまま作り直すと、後でワーカーが補償を続けて作り直した加入者を消すおそれがある（ステップ 7 で運用ガイドを書く中で見つかった） | 同じ IMSI に未完了の記録があれば、加入者の作成・変更・削除とポリシーの PUT・DELETE を 409（`OPERATION_UNRESOLVED`）で断る（§9.3）。API 仕様を 0.2.0 にした |
 
 ## 16. 実装ステップ
 
 各ステップの終わりに「作ったもの」と「実際に動かして確かめたこと」を報告して確認をもらう。
 
-1. API 仕様（`docs/openapi/provisioner-api.yaml`）の作成 … 作成済み（0.1.0。2026-10-10）
+1. API 仕様（`docs/openapi/provisioner-api.yaml`）の作成 … 作成済み（0.1.0。2026-10-10）。§15 の 3 で 0.2.0
 2. 骨組み: 設定、ログ、mTLS のサーバー（フィンガープリントの固定、サーバー証明書の生成）、`/status`、サブコマンド（`gen-client-cert`、`server-cert`、`check-downstream`）、専用 Valkey、compose … 実装済み（2026-10-10）。手元と simwifi（同一ホスト）で確認済み
 3. 下流のクライアント（prov / aka。diagnose を含む）と契約テスト、CI … 実装済み（2026-10-10）。型つきの呼び出しは加入者の統合操作で使うもの（prov の加入者・認可ポリシー、aka の加入者・AVクライアント）。中継（RADIUSクライアント、セッション、監査ログ）は要求と応答をそのまま渡す `Relay` で行う
 4. 中継する操作（§7）、ロック、`Idempotency-Key`、監査ログ … 実装済み（2026-10-10）。手元で下流をバイナリで起動して確認済み
 5. 加入者の統合操作（§6）と操作の記録・要求の中の補償 … 実装済み（2026-10-10）。統合操作は `internal/subscriber`（ステップ 6 のワーカーも使う）、入力の検証とエラーの応答は `internal/api`。手元で下流をバイナリで起動して確認済み
 6. やり直しのワーカーと `/operations` … 実装済み（2026-10-10）。手元で下流をバイナリで起動し、要求が落ちた記録を Valkey に置いて確認済み
-7. 運用ガイド・README、simwifi での確認（同一ホスト・別ホスト、eapaka_test での認証）
+7. 運用ガイド・README、simwifi での確認（同一ホスト・別ホスト、eapaka_test での認証） … 完了（2026-10-10）。運用ガイドは `docs/operation-guide.md`。simwifi の同一ホスト（本PoCの全体・aka-only-server・provisioner を compose で起動）で、provisioner から作った `poc` と `aka` の加入者が eapaka_test で認証できること、変更・削除・中継・監査ログ・`/operations`（要求が落ちた記録を置いて、ワーカーのやり直し・`retry`・`dismiss`）を確認した。別ホストは、手元（WSL）のバイナリの provisioner から Tailscale のアドレスで simwifi の下流に接続して同じく認証まで確かめ、simwifi の provisioner を `COMPOSE_FILE=compose.yaml` だけにした構成と、別ホストの管理クライアントからの接続も確かめた
 
 BFF（web-gui-for-eapaka-radius）の provisioner への付け替えは、この後に BFF のリポジトリで行う。

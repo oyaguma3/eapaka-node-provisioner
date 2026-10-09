@@ -20,6 +20,7 @@ const (
 	causeOperationNotFound       = "OPERATION_NOT_FOUND"
 	causeOperationStateConflict  = "OPERATION_STATE_CONFLICT"
 	causeOperationInProgress     = "OPERATION_IN_PROGRESS"
+	causeOperationUnresolved     = "OPERATION_UNRESOLVED"
 	causeIdempotencyKeyMismatch  = "IDEMPOTENCY_KEY_MISMATCH"
 	causeDownstreamError         = "DOWNSTREAM_ERROR"
 	causeDownstreamUnavailable   = "DOWNSTREAM_UNAVAILABLE"
@@ -45,7 +46,8 @@ type problem struct {
 	DownstreamStatus int `json:"downstreamStatus,omitzero"`
 	// DownstreamCause は下流の cause。
 	DownstreamCause string `json:"downstreamCause,omitempty"`
-	// OperationID は操作の記録の ID（加入者の作成・変更・削除で、下流への書き込みを始めた後に失敗した場合）。
+	// OperationID は操作の記録の ID（加入者の作成・変更・削除で、下流への書き込みを始めた後に失敗した場合。
+	// OPERATION_UNRESOLVED では、同じ IMSI の未完了の操作）。
 	OperationID string `json:"operationId,omitempty"`
 	// RolledBack は、補償で元に戻したか（OperationID を返す場合だけ）。
 	RolledBack *bool `json:"rolledBack,omitempty"`

@@ -152,6 +152,19 @@ func (e *ConflictError) Error() string {
 	return fmt.Sprintf("subscriber already exists in %v", e.Places)
 }
 
+// UnresolvedError は、同じ IMSI に未完了（running / retrying / failed）の操作の記録があるため、新しい操作を断ったことを表す
+// （OPERATION_UNRESOLVED）。古い操作の続き（補償・やり直し）が新しい操作の結果を消さないようにする（設計概要 §9.3）。
+type UnresolvedError struct {
+	// OperationID は未完了の操作の ID（複数あれば最も古いもの）。
+	OperationID string
+	// Status はその操作の状態。
+	Status string
+}
+
+func (e *UnresolvedError) Error() string {
+	return fmt.Sprintf("operation %s on the same IMSI is unresolved (%s)", e.OperationID, e.Status)
+}
+
 // DownstreamError は下流の呼び出しの失敗。
 type DownstreamError struct {
 	Name downstream.Name

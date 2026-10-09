@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"maps"
 	"mime"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/downstream"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/provapi"
 	"github.com/oyaguma3/eapaka-node-provisioner/internal/store"
+	"github.com/oyaguma3/eapaka-node-provisioner/internal/subscriber"
 )
 
 // 中継（設計概要 §7）。要求の本文は検証せずにそのまま下流に送り、下流の応答（エラーを含む）をそのまま返す。
@@ -207,7 +209,8 @@ func (h *Handler) relayPolicies(w http.ResponseWriter, r *http.Request) {
 	h.relay(w, r, downstream.Prov, h.Prov, []string{"policies"}, nil)
 }
 
-// relayPolicy は認可ポリシーの取得・PUT・削除を中継する。PUT と削除は、加入者の操作と同じ IMSI のロックを取る。
+// relayPolicy は認可ポリシーの取得・PUT・削除を中継する。PUT と削除は、加入者の操作と同じ IMSI のロックを取り、
+// 同じ IMSI に未完了の操作があれば断る（その補償・やり直しがポリシーを書き換えるため）。
 func (h *Handler) relayPolicy(w http.ResponseWriter, r *http.Request) {
 	imsi, ok := pathIMSI(w, r)
 	if !ok {
@@ -231,6 +234,14 @@ func (h *Handler) relayPolicy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer unlock()
+		if err := h.Subscribers.CheckUnresolved(r.Context(), imsi); err != nil {
+			if ue, ok := errors.AsType[*subscriber.UnresolvedError](err); ok {
+				writeUnresolved(w, r, ue)
+			} else {
+				h.internalError(w, r, err)
+			}
+			return
+		}
 	}
 	h.relay(w, r, downstream.Prov, h.Prov, []string{"policies", imsi}, a)
 }

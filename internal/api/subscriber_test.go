@@ -34,6 +34,8 @@ type fakeSubs struct {
 	opArgs    []any
 	counts    [3]int
 	countsErr error
+	// unresolved は CheckUnresolved が返すエラー（ポリシーの PUT・DELETE）。
+	unresolved error
 }
 
 func (f *fakeSubs) Get(context.Context, string) (subscriber.Subscriber, error) { return f.sub, f.err }
@@ -77,6 +79,7 @@ func (f *fakeSubs) Dismiss(_ context.Context, a subscriber.Actor, _ string) (sto
 	f.actor = a
 	return f.op, f.err
 }
+func (f *fakeSubs) CheckUnresolved(context.Context, string) error { return f.unresolved }
 func (f *fakeSubs) OperationCounts(context.Context) (map[string]int, error) {
 	return map[string]int{"running": f.counts[0], "retrying": f.counts[1], "failed": f.counts[2]}, f.countsErr
 }
@@ -398,5 +401,55 @@ func TestCreateSubscriberIdempotent(t *testing.T) {
 	e.subs.err = nil
 	if w := e.doBody("POST", "/admin/v1/subscribers", hdr, validCreate); w.Code != 201 || w.Header().Get("Idempotent-Replayed") != "" {
 		t.Errorf("after locked = %d %v", w.Code, w.Header())
+	}
+}
+
+func TestUnresolvedOperation(t *testing.T) {
+	e := newEnv(t, true)
+	unresolved := &subscriber.UnresolvedError{OperationID: "0199c8a2-0000-7000-8000-000000000001", Status: store.OpFailed}
+	hdr := map[string]string{"Content-Type": "application/json", "Idempotency-Key": "create-u"}
+
+	// 加入者の作成・変更・削除: 409 OPERATION_UNRESOLVED と operationId。
+	e.subs.err = unresolved
+	for _, c := range []struct{ method, path, body string }{
+		{"POST", "/admin/v1/subscribers", validCreate},
+		{"PATCH", "/admin/v1/subscribers/001010000000001", `{"amf":"8000"}`},
+		{"DELETE", "/admin/v1/subscribers/001010000000001", ""},
+	} {
+		p := decode[problem](t, e.doBody(c.method, c.path, hdr, c.body), 409)
+		if p.Cause != "OPERATION_UNRESOLVED" || p.OperationID != unresolved.OperationID || !strings.Contains(p.Detail, "/operations/"+unresolved.OperationID) {
+			t.Errorf("%s %s = %+v", c.method, c.path, p)
+		}
+		hdr["Idempotency-Key"] += "x"
+	}
+	// Idempotency-Key では覚えない（片付けた後に同じキーで送り直せる）。
+	hdr["Idempotency-Key"] = "create-u"
+	e.subs.err, e.subs.res = nil, completedRes
+	if w := e.doBody("POST", "/admin/v1/subscribers", hdr, validCreate); w.Code != 201 || w.Header().Get("Idempotent-Replayed") != "" {
+		t.Errorf("after resolved = %d %s", w.Code, w.Body)
+	}
+
+	// ポリシーの PUT・DELETE も断り、下流を呼ばない。取得は通る。
+	e.subs.unresolved = unresolved
+	before := e.prov.calls()
+	for _, method := range []string{"PUT", "DELETE"} {
+		p := decode[problem](t, e.doBody(method, "/admin/v1/policies/001010000000001", jsonHeader, `{"default":"allow","rules":[]}`), 409)
+		if p.Cause != "OPERATION_UNRESOLVED" || p.OperationID != unresolved.OperationID {
+			t.Errorf("%s policy = %+v", method, p)
+		}
+	}
+	if e.prov.calls() != before {
+		t.Errorf("downstream was called: %d -> %d", before, e.prov.calls())
+	}
+	if w := e.do("GET", "/admin/v1/policies/001010000000001", nil); w.Code != 200 {
+		t.Errorf("get policy = %d", w.Code)
+	}
+	// 確かめられない（Valkey のエラー）なら 500 で、下流は呼ばない。
+	e.subs.unresolved = errors.New("valkey down")
+	if p := decode[problem](t, e.doBody("PUT", "/admin/v1/policies/001010000000001", jsonHeader, `{}`), 500); p.Cause != "SYSTEM_FAILURE" {
+		t.Errorf("store error = %+v", p)
+	}
+	if e.prov.calls() != before+1 {
+		t.Errorf("downstream calls = %d, want %d (only the GET)", e.prov.calls(), before+1)
 	}
 }

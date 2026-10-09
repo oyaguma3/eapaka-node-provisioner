@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"slices"
 	"time"
 	"uuid"
 
@@ -333,6 +334,44 @@ func (s *Service) lock(ctx context.Context, imsi string) (unlock func(), err err
 	}, nil
 }
 
+// lockForNew は、新しい操作のために IMSI のロックを取り、同じ IMSI に未完了の操作がないことを確かめる。
+// 未完了の操作があれば、ロックを解放して *UnresolvedError を返す。
+func (s *Service) lockForNew(ctx context.Context, imsi string) (unlock func(), err error) {
+	unlock, err = s.lock(ctx, imsi)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.CheckUnresolved(ctx, imsi); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
+}
+
+// CheckUnresolved は、imsi に未完了（running / retrying / failed）の操作の記録があれば *UnresolvedError を返す。
+// 呼び出し側は IMSI のロックを取ってから呼ぶ（ロックの間は、同じ IMSI の記録は増えない。ロックを持つ実行中の操作もない）。
+// このため running の記録は、要求が落ちてワーカーが続きを行うのを待っているものである。
+func (s *Service) CheckUnresolved(ctx context.Context, imsi string) error {
+	ids, err := s.Store.ActiveOperations(ctx)
+	if err != nil {
+		return err
+	}
+	slices.Sort(ids) // UUID version 7 は作成の時刻の順に並ぶ
+	for _, id := range ids {
+		op, err := s.Store.GetOperation(ctx, id)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if op.IMSI == imsi && !op.Final() {
+			return &UnresolvedError{OperationID: op.ID, Status: op.Status}
+		}
+	}
+	return nil
+}
+
 func dsOf(ks plmn.KeyStore) downstream.Name {
 	if ks == plmn.KeyStoreAKA {
 		return downstream.Aka
@@ -345,7 +384,7 @@ func dsOf(ks plmn.KeyStore) downstream.Name {
 // Create は加入者を作成する（設計概要 §6.2）。置き場所に加入者を作り、認可ポリシーを PUT する。
 // 途中で失敗したら補償で戻し、*OperationError を返す。
 func (s *Service) Create(ctx context.Context, a Actor, in CreateInput) (Subscriber, Result, error) {
-	unlock, err := s.lock(ctx, in.IMSI)
+	unlock, err := s.lockForNew(ctx, in.IMSI)
 	if err != nil {
 		return Subscriber{}, Result{}, err
 	}
@@ -432,7 +471,7 @@ func (s *Service) createKey(ctx context.Context, st *state, in CreateInput) erro
 // Update は加入者を変更する（設計概要 §6.2）。認可ポリシーを先に PUT し、戻せない鍵の変更を最後に行う。
 // 鍵の変更が失敗したら、ポリシーを変更前に戻し、*OperationError を返す。
 func (s *Service) Update(ctx context.Context, a Actor, imsi string, in UpdateInput) (Subscriber, Result, error) {
-	unlock, err := s.lock(ctx, imsi)
+	unlock, err := s.lockForNew(ctx, imsi)
 	if err != nil {
 		return Subscriber{}, Result{}, err
 	}
@@ -532,7 +571,7 @@ func (s *Service) updateKey(ctx context.Context, st *state, imsi string, in Upda
 // Delete は加入者を削除する（設計概要 §6.2）。認可ポリシー、置き場所の加入者の順に削除する。
 // 削除は戻せないので、途中で失敗したら残りを後でやり直す（*OperationError の Incomplete）。
 func (s *Service) Delete(ctx context.Context, a Actor, imsi string) (Result, error) {
-	unlock, err := s.lock(ctx, imsi)
+	unlock, err := s.lockForNew(ctx, imsi)
 	if err != nil {
 		return Result{}, err
 	}

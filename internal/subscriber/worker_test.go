@@ -283,3 +283,68 @@ func TestOperationsAndDismiss(t *testing.T) {
 		t.Errorf("dismiss locked: %v", err)
 	}
 }
+
+func TestUnresolvedOperationBlocksNewOperations(t *testing.T) {
+	// 作成の補償が残った（aka-only-server に接続できず、作った加入者を消せていない）。
+	e := newEnv(t)
+	e.aka.subs[akaIMSI] = akaapi.Subscriber{IMSI: akaIMSI, AllowedClientIDs: []int64{1}}
+	op := e.staleOp("0199c8a2-0000-7000-8000-000000000001", KindCreate, akaIMSI, "aka",
+		step("subscriber.create", "aka", "done"), step("policy.put", "prov", "failed"),
+		step("subscriber.compensate", "aka", "failed"))
+	op.Status = store.OpRetrying
+	e.st.put(op)
+	// 別の IMSI の完了した操作は妨げない。
+	done := e.staleOp("0199c8a2-0000-7000-8000-000000000002", KindCreate, pocIMSI, "poc")
+	done.Status = store.OpCompleted
+	e.st.put(done)
+	ctx := t.Context()
+
+	// 同じ IMSI の作成・変更・削除は、下流を呼ばずに断る。作り直した加入者が補償で消されないように。
+	isUnresolved := func(err error) bool {
+		ue, ok := errors.AsType[*UnresolvedError](err)
+		return ok && ue.OperationID == op.ID && ue.Status == store.OpRetrying
+	}
+	if _, _, err := e.s.Create(ctx, actor, CreateInput{IMSI: akaIMSI, Ki: "aa", OPc: "bb", Policy: policy}); !isUnresolved(err) {
+		t.Errorf("create: %v", err)
+	}
+	if _, _, err := e.s.Update(ctx, actor, akaIMSI, UpdateInput{Policy: &policy}); !isUnresolved(err) {
+		t.Errorf("update: %v", err)
+	}
+	if _, err := e.s.Delete(ctx, actor, akaIMSI); !isUnresolved(err) {
+		t.Errorf("delete: %v", err)
+	}
+	if err := e.s.CheckUnresolved(ctx, akaIMSI); !isUnresolved(err) {
+		t.Errorf("check: %v", err)
+	}
+	if c := slices.Concat(e.prov.callList(), e.aka.callList()); len(c) != 0 {
+		t.Errorf("downstream calls = %v", c)
+	}
+	if len(e.st.locks) != 0 {
+		t.Errorf("locks were not released: %v", e.st.locks)
+	}
+
+	// 別の IMSI は通る。
+	if _, _, err := e.s.Create(ctx, actor, CreateInput{IMSI: pocIMSI, Ki: "aa", OPc: "bb", Policy: policy}); err != nil {
+		t.Errorf("other imsi: %v", err)
+	}
+
+	// failed と、要求が落ちた running も断る。閉じた（dismissed）後は通る。
+	for _, status := range []string{store.OpFailed, store.OpRunning} {
+		op.Status = status
+		e.st.put(op)
+		if err := e.s.CheckUnresolved(ctx, akaIMSI); err == nil {
+			t.Errorf("%s: not refused", status)
+		}
+	}
+	op.Status = store.OpFailed
+	e.st.put(op)
+	if _, err := e.s.Dismiss(ctx, actor, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.Delete(ctx, actor, akaIMSI); err != nil {
+		t.Errorf("delete after dismiss: %v", err)
+	}
+	if _, ok := e.aka.subs[akaIMSI]; ok {
+		t.Error("aka subscriber remains")
+	}
+}
