@@ -351,6 +351,8 @@ docker compose up -d
 
 provisioner の compose は、同一ホストの管理クライアント向けの共有ネットワーク（既定の名前は `eapaka-provisioner`、変数 `PROVISIONER_SHARED_NETWORK`）を作り、provisioner だけを参加させる。同じホストで別の compose として動く管理クライアントは、ここに外部ネットワークとして参加し、`https://eapaka-provisioner:9446/admin/v1` で接続する。ホスト側に公開したポート（`127.0.0.1:9446`）には、別のコンテナからは届かない。
 
+本PoCの管理 GUI（web-gui-for-eapaka-radius）は、provisioner 経由でつなぐ設定を持っている（その運用ガイドの 11 章。同一ホスト用の `compose.eapaka-provisioner.yaml`、直接接続からの切り替え、別ホスト、戻し方）。2026-10-10 に、本書の構成と合わせて検証機で確かめた。
+
 管理クライアント側の compose の例（サービス名・イメージ等は管理クライアント側の手順に従う）:
 
 ```yaml

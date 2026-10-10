@@ -310,4 +310,4 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 6. やり直しのワーカーと `/operations` … 実装済み（2026-10-10）。手元で下流をバイナリで起動し、要求が落ちた記録を Valkey に置いて確認済み
 7. 運用ガイド・README、simwifi での確認（同一ホスト・別ホスト、eapaka_test での認証） … 完了（2026-10-10）。運用ガイドは `docs/operation-guide.md`。simwifi の同一ホスト（本PoCの全体・aka-only-server・provisioner を compose で起動）で、provisioner から作った `poc` と `aka` の加入者が eapaka_test で認証できること、変更・削除・中継・監査ログ・`/operations`（要求が落ちた記録を置いて、ワーカーのやり直し・`retry`・`dismiss`）を確認した。別ホストは、手元（WSL）のバイナリの provisioner から Tailscale のアドレスで simwifi の下流に接続して同じく認証まで確かめ、simwifi の provisioner を `COMPOSE_FILE=compose.yaml` だけにした構成と、別ホストの管理クライアントからの接続も確かめた
 
-BFF（web-gui-for-eapaka-radius）の provisioner への付け替えは、この後に BFF のリポジトリで行う。
+BFF（web-gui-for-eapaka-radius）からの接続は、BFF のリポジトリで行った（2026-10-10。BFF の設計概要 §12）。BFF は接続先を設定で選び（既定は provisioning-api に直接）、provisioner 経由のときは加入者・操作の記録・監査ログの画面が provisioner の API を使う。
