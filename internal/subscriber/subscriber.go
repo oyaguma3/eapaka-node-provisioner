@@ -134,6 +134,8 @@ type Subscriber struct {
 	Key *Key
 	// Policy は認可ポリシー。ない場合は nil。
 	Policy *provapi.PolicyPut
+	// Status は認可ポリシーの状態（active / suspended）。ポリシーがない場合は空文字列。
+	Status string
 	Issues []Issue
 }
 
@@ -313,6 +315,7 @@ func (s *Service) view(imsi string, st state) Subscriber {
 	}
 	if st.policy != nil {
 		sub.Policy = &provapi.PolicyPut{Default: st.policy.Default, Rules: st.policy.Rules}
+		sub.Status = st.policy.Status
 	} else {
 		sub.Issues = append(sub.Issues, IssuePolicyMissing)
 	}

@@ -1,13 +1,13 @@
 # eapaka-node-provisioner 設計概要
 
-- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。§16 のステップ 7（運用ガイド・README、simwifi での確認）まで完了。導入と運用の手順は `docs/operation-guide.md`。
+- 状態: 初版（2026-10-10）。設計の確認事項に合意済み。§16 のステップ 7（運用ガイド・README、simwifi での確認）まで完了。加入者の停止・再開（§15 の 4）を加えた。導入と運用の手順は `docs/operation-guide.md`。
 - 対象: 統合API（コマンド名 `eapaka-provisioner`。以下「provisioner」）。
 - 関連:
   - 本PoC（eapaka-radius-server-poc）の Provisioning API: `docs/D-13_Provisioning_API詳細設計書_r*.md`、`docs/openapi/provisioning-api.yaml`
   - aka-only-server の管理API: `docs/design-overview.md`、`docs/openapi/admin-api.yaml`
   - Vector Gateway の接続方式と PLMN マップ: 本PoCの `docs/D-12_Vector_Gateway_詳細設計書_r*.md`
   - 手本にする実装: web-gui-for-eapaka-radius（以下「BFF」）の `internal/provapi`、web-gui-for-aka-only-server の `internal/adminapi`
-- API の契約: `docs/openapi/provisioner-api.yaml`（0.2.0）。項目・エラーの詳細はそちらに書き、本書では方針を書く。
+- API の契約: `docs/openapi/provisioner-api.yaml`（0.3.0）。項目・エラーの詳細はそちらに書き、本書では方針を書く。
 
 ## 1. 位置づけ
 
@@ -30,7 +30,7 @@ EAP-AKA RADIUS PoC（以下「本PoC」）の Provisioning API と、aka-only-se
 
 | 区分 | 内容 |
 |---|---|
-| 対象 | 本PoC 1 ノードと aka-only-server 1 台の組。加入者の統合操作（作成・取得・変更・削除・鍵の取得・一覧）、RADIUSクライアント・認可ポリシー・セッション・監査ログの中継、vector-gateway の AVクライアントの参照、操作の記録と補償・やり直し |
+| 対象 | 本PoC 1 ノードと aka-only-server 1 台の組。加入者の統合操作（作成・取得・変更・削除・鍵の取得・一覧）、RADIUSクライアント・認可ポリシー（加入者の停止・再開を含む）・セッション・監査ログの中継、vector-gateway の AVクライアントの参照、操作の記録と補償・やり直し |
 | 対象外 | 複数ノード、AVクライアントと AV用サーバー証明書の管理（aka 版 GUI で行う）、aka-only-server のサーバーログの参照、CSV の一括操作（本PoCの Admin TUI だけで行う）、セッションの切断、操作者ごとの権限、IPv6 の RADIUSクライアント |
 
 将来の拡張は §14。
@@ -80,12 +80,14 @@ EAP-AKA RADIUS PoC（以下「本PoC」）の Provisioning API と、aka-only-se
   "keyStore": "aka",
   "key": { "amf": "8000", "sqn": "000000000020", "sqnType": "inc32", "allowPlain": false, "createdAt": "..." },
   "policy": { "default": "allow", "rules": [] },
+  "status": "active",
   "issues": []
 }
 ```
 
 - `key` は置き場所の加入者の属性（Ki / OPc は含まない）。`sqnType` / `allowPlain` / `allowedClientIds` / `updatedAt` は `aka` のときだけ含む。
 - `policy` は prov の認可ポリシー。ない場合は省略する。
+- `status` は加入者の状態（`active` / `suspended`）で、prov の認可ポリシーの `status` をそのまま出す（§15 の 4）。認可ポリシーがない場合は省略する。`policy` の中に入れないのは、`policy` を変更（PATCH）の本文と同じ形に保つため（状態は作成・変更では指定できない）。
 - `issues` は 2 つのノードの状態の食い違い（下表）。正常なら空。
 
 | `issues` の値 | 状態 |
@@ -137,6 +139,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 |---|---|---|
 | `/clients`、`/clients/{clientId}`、`/clients/{clientId}/secret` | prov の同じパス | RADIUSクライアント |
 | `/policies`、`/policies/{imsi}` | prov の同じパス | 加入者の操作と同じ IMSI のロックを取る（§9.1） |
+| `/policies/{imsi}/status`（PUT） | prov の同じパス | 加入者の停止・再開（§15 の 4）。加入者の操作と同じ IMSI のロックを取る（§9.1） |
 | `/sessions` | prov の `/sessions` | 読み取りだけ |
 | `/prov/audit-logs` | prov の `/audit-logs` | 読み取りだけ。下流の形のまま返す |
 | `/aka/audit-logs` | aka の `/audit-logs` | 読み取りだけ。下流の形のまま返す |
@@ -165,7 +168,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 
 ### 9.1 IMSI ごとのロック
 
-- 加入者の作成・変更・削除と、ポリシーの PUT・DELETE は、`lock:imsi:{imsi}` を `SET NX PX` で取ってから行う。取れなければ待たずに 409（`OPERATION_IN_PROGRESS`）を返す。
+- 加入者の作成・変更・削除と、ポリシーの PUT・DELETE・停止・再開は、`lock:imsi:{imsi}` を `SET NX PX` で取ってから行う。取れなければ待たずに 409（`OPERATION_IN_PROGRESS`）を返す。
 - 有効期限は、1 つの操作にかかる最大の時間（下流の呼び出しのタイムアウト × 手順の数）より長くする（既定 60 秒）。解放はトークンを比べて消す（Lua）。
 - ロックは provisioner を通る操作どうしでだけ効く。Admin TUI、aka 版 GUI、下流の API を直接呼ぶ操作とは排他できない（下流に条件つきの書き込みがないため）。provisioner を使う間は、同じ加入者をそれらで操作しない運用とする。
 
@@ -194,7 +197,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 
 - **要求の中の補償:** 途中で失敗したら、その場で補償する。戻せたら `rolled_back` とし、最初の失敗のエラーに `operationId` と `rolledBack: true` を付けて返す。
 - **反映されたかどうか:** 下流が 4xx で断った手順は「反映されていない」とみなし、補償しない（作成の 409 は、provisioner の外で作られたものなので消さない）。接続できない・タイムアウト・5xx の手順は、書き込まれたかどうか分からないので、反映された可能性があるとみなして補償する（既にないものの削除は成功とするので安全）。
-- **補償の手順:** 作成は、ポリシーを PUT した可能性があれば `policy.delete`、加入者を作った可能性があれば `subscriber.compensate` を、この順に加えて行う（存在確認で、どちらもなかったことを確かめてある）。変更は、ポリシーを PUT した可能性があれば `policy.restore`（変更前に戻す。変更前になければ削除）を加える。要求の中で行わなかった手順は `skipped` にする。
+- **補償の手順:** 作成は、ポリシーを PUT した可能性があれば `policy.delete`、加入者を作った可能性があれば `subscriber.compensate` を、この順に加えて行う（存在確認で、どちらもなかったことを確かめてある）。変更は、ポリシーを PUT した可能性があれば `policy.restore`（変更前に戻す。変更前になければ削除）を加える。要求の中で行わなかった手順は `skipped` にする。変更前のポリシーは状態（`status`）を含めずに覚え、PUT で戻す。prov のポリシーの PUT は状態を変えないので、停止中の加入者の補償で停止が解けることはない（§15 の 4）。
 - **記録が書けないとき:** 最初の記録が書けなければ、下流には何もせず 500（`SYSTEM_FAILURE`）を返す。書き込みを始めた後に記録が書けなくなったら、成功として返さずにその場で補償する（最後の「完了」だけが残らないと、ワーカーが成功した操作を取り消してしまうため）。例外として、鍵の変更が済んだ後の「完了」が書けない場合は、鍵は戻せないので、1 回だけ書き直しを試みたうえで成功として返す（それでも書けなければ記録は実行中のまま残り、ワーカーが `failed` にする。下の「鍵の変更が分からない変更」）。削除は、記録が書けなくても前に進める。
 - **実行中の記録:** 実行中の操作の「次に処理してよい時刻」は、作成時刻にロックの有効期限（60 秒）を足したもの。これを過ぎても実行中なら、要求が落ちたとみなす。
 - **戻せなかったとき:** `retrying` にし、500（`OPERATION_INCOMPLETE`）に `operationId` と残った手順を付けて返す。ERROR のログを出す。
@@ -202,7 +205,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 - **ワーカーが下流に渡すもの:** 元の操作の操作者（`X-Operator-Id`）とトレースID（`X-Trace-ID`）を渡す。下流の監査ログでは、補償も元の操作と同じトレースID で突き合わせられる。
 - **鍵の変更が分からない変更:** 実行中のまま残った変更の記録で、鍵の手順が終わっておらず、その前のポリシーの手順が済んでいる（またはポリシーの手順がない）ものは、鍵の変更が反映されたかどうか分からない（変更前の Ki / OPc は残さないので戻せない）。ワーカーは自動では何もせず `failed` にして ERROR のログを出す（2026-10-10 決定）。手でのやり直し（`retry`）もできず（409）、人が下流の状態を確かめて直した後に `dismiss` で閉じる。ポリシーの手順が終わっていなければ、鍵には進んでいないので、ポリシーを変更前に戻す。
 - **プロセスが落ちたとき:** `running` のまま更新されない操作も、ロックの有効期限を過ぎればワーカーが拾って同じように処理する。下流を呼んだ後、記録を書く前に落ちた場合に備え、補償とやり直しは何度行っても結果が同じ操作（削除の 404 は成功とみなす、ポリシーの PUT）だけで組む。
-- **未完了の操作がある IMSI への新しい操作:** 同じ IMSI に未完了（`running` / `retrying` / `failed`）の記録があれば、加入者の作成・変更・削除と、ポリシーの PUT・DELETE を 409（`OPERATION_UNRESOLVED`。その操作の `operationId` 付き）で断り、下流は呼ばない（§15 の 3）。古い操作の続き（補償・やり直し）が、新しい操作の結果を消さないようにするため（例: 作成の補償が残ったまま作り直すと、作り直した加入者が補償で消される）。IMSI のロックを取った後に `ops:active` の記録を読んで確かめる（ロックの間は同じ IMSI の記録は増えず、ロックを持つ実行中の操作もないので、見つかる `running` は要求が落ちたもの）。未完了の操作は通常は少ないので、索引は設けずに全件を読む。`retry` と `dismiss`、ワーカーは対象外（片付けるための操作のため）。
+- **未完了の操作がある IMSI への新しい操作:** 同じ IMSI に未完了（`running` / `retrying` / `failed`）の記録があれば、加入者の作成・変更・削除と、ポリシーの PUT・DELETE・停止・再開を 409（`OPERATION_UNRESOLVED`。その操作の `operationId` 付き）で断り、下流は呼ばない（§15 の 3）。古い操作の続き（補償・やり直し）が、新しい操作の結果を消さないようにするため（例: 作成の補償が残ったまま作り直すと、作り直した加入者が補償で消される）。IMSI のロックを取った後に `ops:active` の記録を読んで確かめる（ロックの間は同じ IMSI の記録は増えず、ロックを持つ実行中の操作もないので、見つかる `running` は要求が落ちたもの）。未完了の操作は通常は少ないので、索引は設けずに全件を読む。`retry` と `dismiss`、ワーカーは対象外（片付けるための操作のため）。
 - **確認と手での対応:** `GET /operations`（`running` / `retrying` / `failed` の一覧）、`GET /operations/{opId}`（完了したものも保持期間のあいだ）、`POST /operations/{opId}/retry`（`failed` の続きをその場で 1 回行い、失敗すれば `retrying` に戻して自動のやり直しを再開する）、`POST /operations/{opId}/dismiss`（`retrying` / `failed` を手で直した後に `dismissed` にして閉じる）。どちらも IMSI のロックを取る。件数は `/status` にも出す。
 - **監査ログ:** ワーカーの処理は、結果が完了（`completed` / `rolled_back`）か `failed` になったときだけ `operation.resume` として残す（`retrying` のままの途中経過は残さない。操作者と管理クライアントは空、トレースID は元の操作のもの）。手での操作は `operation.retry` / `operation.dismiss` として、要求者つきで残す。監査ログを残す処理は `internal/audit` にまとめ、HTTP の要求とワーカーの両方が使う。
 - 操作の ID は UUID version 7（時刻順に並ぶ。Go の標準ライブラリで作れる）。
@@ -220,9 +223,10 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 - `X-Operator-Id`（`^[A-Za-z0-9._@-]{1,64}$`）を受け取り、そのまま下流 2 つに渡す。下流の監査ログには「操作者＝BFF の利用者、`mgmt_client`＝provisioner」が残る。
 - `X-Trace-ID`（印字可能 ASCII 1〜64 文字）を受け取るか採番し（16 バイトの乱数の 16 進 32 桁）、同じ値を下流 2 つに渡して応答のヘッダーでも返す。prov と aka（管理API 0.2.0 以降）は、ログと監査ログに記録する（§15 の 1）。
 - provisioner の監査ログは、標準出力（JSON）に出し、あわせて Valkey の Stream `audit` に保存する（上限 `PROVISIONER_AUDIT_MAX`、既定 10000）。保存に失敗しても操作は成功として扱い、ERROR のログを出す（prov と同じ）。
-- 監査ログの項目: `id`、`time`、`operator`、`mgmtClient`、`action`、`target`、`traceId`、`operationId`、`result`（`completed` / `rolled_back` / `retrying` / `failed` / `dismissed`）、`details`（下流ごとの結果。秘密の値は含まない）。`action` は下流と同じ命名（`subscriber.create` 等）に、`operation.resume`（自動のやり直しの結果。操作者と管理クライアントは空）、`operation.retry`、`operation.dismiss` を加える。
+- 監査ログの項目: `id`、`time`、`operator`、`mgmtClient`、`action`、`target`、`traceId`、`operationId`、`result`（`completed` / `rolled_back` / `retrying` / `failed` / `dismissed`）、`details`（下流ごとの結果。秘密の値は含まない）。`action` は下流と同じ命名（`subscriber.create`、停止・再開の `policy.suspend` / `policy.resume` 等）に、`operation.resume`（自動のやり直しの結果。操作者と管理クライアントは空）、`operation.retry`、`operation.dismiss` を加える。
 - 記録するのは、変更操作が成功したとき、加入者の作成・変更・削除で下流への書き込みを始めた後に失敗したとき、秘密の値を取得したとき。書き込む前に断った要求（入力の誤り、409 等）は監査ログに残さない（アプリケーションログには残る）。
 - 秘密の値の取得（`/subscribers/{imsi}/keys`、`/clients/{clientId}/secret`）も、そのたびに監査ログに残す（値は残さない）。
+- 停止・再開の `action` は、応答（変更後の認可ポリシー）の状態で決める。今と同じ状態への変更は、prov は書き込まず監査ログにも残さないが、provisioner は受け付けた要求として残す（§15 の 4）。
 - 中継した操作の `details` は、下流の名前（`downstream`）と、変更なら変えた項目の名前（`fields`）だけとする。中継の本文は検証しない方針で、秘密の値を含みうるため、値は残さない（変更前後の値は下流の監査ログにある）。RADIUSクライアントの作成の `target` は、下流が採番した ID。
 
 ### 10.3 アプリケーションログ
@@ -297,6 +301,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 | 1 | aka-only-server の管理API は `X-Trace-ID` を受け取らず、監査ログにも残さない（2026-10-10 に確認）。provisioner の操作と aka の監査ログを突き合わせる手がかりが、操作者と時刻だけになる | aka-only-server の管理API に、prov と同じ作法の `X-Trace-ID`（受け取り・採番・応答で返す・ログと監査ログの `traceId`）を加える。OpenAPI・実装・テストと aka 版 GUI のクライアントもあわせて直す。provisioner の API 仕様の作成より前に行う。**実施済み（2026-10-10）**: aka-only-server 管理API 0.2.0（`2a6dcf8`）、aka 版 GUI（`b65d30a`）。認証ベクターAPI への追加は aka-only-server の今後の課題（同リポジトリの設計概要 §13.1） |
 | 2 | PLMN マップで `01` に当たる aka 側の加入者を、他の AVクライアントと共有している場合の削除 | provisioner はそれらを本PoCの加入者として扱い、削除では aka 側の加入者ごと削除する（他の AVクライアントとは共有しない前提）。共有が要る場合は、削除で自分の AVクライアントID を外すだけにする案に切り替える |
 | 3 | 加入者の作成・変更・削除が、同じ IMSI の未完了（retrying / failed）の操作の記録を見ていない。作成の補償が残ったまま作り直すと、後でワーカーが補償を続けて作り直した加入者を消すおそれがある（ステップ 7 で運用ガイドを書く中で見つかった） | 同じ IMSI に未完了の記録があれば、加入者の作成・変更・削除とポリシーの PUT・DELETE を 409（`OPERATION_UNRESOLVED`）で断る（§9.3）。API 仕様を 0.2.0 にした |
+| 4 | 外部 OSS/BSS のサンプル実装（eapaka-ossbss-sample。同リポジトリの設計概要 §8・§15）に、加入者を登録したまま一時的に使えなくする（停止）・戻す（再開）手段が要る | 本PoCの認可ポリシーに状態 `status`（`active` / `suspended`）を加えた（Provisioning API 0.4.0。本PoC `dbd97f5`）。provisioner は `PUT /policies/{imsi}/status` を中継し（ロック、未完了の操作の確認、`Idempotency-Key`、監査ログ `policy.suspend` / `policy.resume`）、加入者の統合リソースに `status` を加える。加入者の操作としての別の口（`/subscribers/{imsi}/suspend` 等）は作らない（停止は本PoCの 1 ノードの操作で、補償の要る複数ノードの操作ではないため）。作成・変更の本文では状態を指定できない。本文の検証は prov に任せ（中継の作法）、監査ログは同じ状態への変更も残す。API 仕様を 0.3.0 にした |
 
 ## 16. 実装ステップ
 
@@ -309,5 +314,7 @@ prov の加入者、aka の加入者、ポリシーの 3 つの一覧を、同�
 5. 加入者の統合操作（§6）と操作の記録・要求の中の補償 … 実装済み（2026-10-10）。統合操作は `internal/subscriber`（ステップ 6 のワーカーも使う）、入力の検証とエラーの応答は `internal/api`。手元で下流をバイナリで起動して確認済み
 6. やり直しのワーカーと `/operations` … 実装済み（2026-10-10）。手元で下流をバイナリで起動し、要求が落ちた記録を Valkey に置いて確認済み
 7. 運用ガイド・README、simwifi での確認（同一ホスト・別ホスト、eapaka_test での認証） … 完了（2026-10-10）。運用ガイドは `docs/operation-guide.md`。simwifi の同一ホスト（本PoCの全体・aka-only-server・provisioner を compose で起動）で、provisioner から作った `poc` と `aka` の加入者が eapaka_test で認証できること、変更・削除・中継・監査ログ・`/operations`（要求が落ちた記録を置いて、ワーカーのやり直し・`retry`・`dismiss`）を確認した。別ホストは、手元（WSL）のバイナリの provisioner から Tailscale のアドレスで simwifi の下流に接続して同じく認証まで確かめ、simwifi の provisioner を `COMPOSE_FILE=compose.yaml` だけにした構成と、別ホストの管理クライアントからの接続も確かめた
+
+加入者の停止・再開（§15 の 4）は、ステップ 7 の後に加えた（2026-10-10）。手元で下流をバイナリで起動して契約テストと操作を確かめ、simwifi で eapaka_test による認証（停止で Reject、再開で Accept。`poc` と `aka` の両方）を確かめた。
 
 BFF（web-gui-for-eapaka-radius）からの接続は、BFF のリポジトリで行った（2026-10-10。BFF の設計概要 §12）。BFF は接続先を設定で選び（既定は provisioning-api に直接）、provisioner 経由のときは加入者・操作の記録・監査ログの画面が provisioner の API を使う。

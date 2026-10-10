@@ -44,6 +44,7 @@ type subscriberJSON struct {
 	KeyStore plmn.KeyStore      `json:"keyStore"`
 	Key      *keyJSON           `json:"key,omitempty"`
 	Policy   *provapi.PolicyPut `json:"policy,omitempty"`
+	Status   string             `json:"status,omitempty"`
 	Issues   []subscriber.Issue `json:"issues"`
 }
 
@@ -58,7 +59,7 @@ type keyJSON struct {
 }
 
 func toJSON(s subscriber.Subscriber) subscriberJSON {
-	out := subscriberJSON{IMSI: s.IMSI, KeyStore: s.KeyStore, Policy: s.Policy, Issues: s.Issues}
+	out := subscriberJSON{IMSI: s.IMSI, KeyStore: s.KeyStore, Policy: s.Policy, Status: s.Status, Issues: s.Issues}
 	if s.Key != nil {
 		k := keyJSON(*s.Key)
 		out.Key = &k

@@ -112,6 +112,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET "+basePath+"/policies/{imsi}", h.relayPolicy)
 	mux.HandleFunc("PUT "+basePath+"/policies/{imsi}", h.idempotent(h.relayPolicy))
 	mux.HandleFunc("DELETE "+basePath+"/policies/{imsi}", h.idempotent(h.relayPolicy))
+	mux.HandleFunc("PUT "+basePath+"/policies/{imsi}/status", h.idempotent(h.relayPolicyStatus))
 	mux.HandleFunc("GET "+basePath+"/sessions", h.relaySessions)
 	mux.HandleFunc("GET "+basePath+"/prov/audit-logs", h.relayProvAuditLogs)
 

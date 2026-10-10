@@ -131,21 +131,56 @@ func TestIntegrationPolicies(t *testing.T) {
 	ctx, putTrace := integrationCtx(t)
 	put := PolicyPut{Default: "deny", Rules: []PolicyRule{{NASID: "AP-IT-01", AllowedSSIDs: []string{"CORP"}, VLANID: "100", SessionTimeout: 3600}}}
 	p, created, err := c.PutPolicy(ctx, imsi, put)
-	if err != nil || !created || p.IMSI != imsi || p.Default != "deny" || len(p.Rules) != 1 || p.Rules[0].VLANID != "100" {
+	// 新規は active（0.4.0 以降の provisioning-api）。
+	if err != nil || !created || p.IMSI != imsi || p.Default != "deny" || len(p.Rules) != 1 || p.Rules[0].VLANID != "100" || p.Status != PolicyActive {
 		t.Fatalf("put (create) = %+v, %v, %v", p, created, err)
 	}
 	downstreamtest.CheckAudit(t, c.Client, putTrace, "policy.create", imsi)
 
-	// 置き換え（全体）。作成でないことが分かる。
+	// 停止（provisioner は PUT /policies/{imsi}/status を中継する）。応答は変更後の認可ポリシー全体。
+	statusCtx, suspendTrace := integrationCtx(t)
+	setStatus := func(ctx context.Context, body string) downstream.RelayResponse {
+		t.Helper()
+		resp, err := c.Relay(ctx, downstream.RelayRequest{Method: http.MethodPut, Path: []string{"policies", imsi, "status"},
+			Body: []byte(body), ContentType: "application/json"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	resp := setStatus(statusCtx, `{"status":"suspended"}`)
+	var sp Policy
+	if resp.Status != http.StatusOK || json.Unmarshal(resp.Body, &sp) != nil || sp.IMSI != imsi || sp.Status != PolicySuspended || sp.Default != "deny" {
+		t.Fatalf("suspend: %+v (%s)", resp, resp.Body)
+	}
+	downstreamtest.CheckAudit(t, c.Client, suspendTrace, "policy.suspend", imsi)
+	// 不正な値は 400（provisioner は検証せずに中継する）。
+	if resp := setStatus(statusCtx, `{"status":"paused"}`); resp.Status != http.StatusBadRequest || !strings.Contains(string(resp.Body), `"cause"`) {
+		t.Errorf("bad status: %+v (%s)", resp, resp.Body)
+	}
+
+	// 置き換え（全体）。作成でないことが分かる。状態は変わらない（provisioner の補償はこれを前提にする）。
 	put = PolicyPut{Default: "allow", Rules: []PolicyRule{}}
-	if p, created, err = c.PutPolicy(ctx, imsi, put); err != nil || created || p.Default != "allow" || len(p.Rules) != 0 {
+	if p, created, err = c.PutPolicy(ctx, imsi, put); err != nil || created || p.Default != "allow" || len(p.Rules) != 0 || p.Status != PolicySuspended {
 		t.Errorf("put (replace) = %+v, %v, %v", p, created, err)
 	}
-	if got, err := c.GetPolicy(t.Context(), imsi); err != nil || got.Default != "allow" {
+	if got, err := c.GetPolicy(t.Context(), imsi); err != nil || got.Default != "allow" || got.Status != PolicySuspended {
 		t.Errorf("get = %+v, %v", got, err)
 	}
-	if l, err := c.ListPolicies(t.Context(), downstream.ListParams{Prefix: imsi}); err != nil || l.Total != 1 || l.Items[0].IMSI != imsi {
+	if l, err := c.ListPolicies(t.Context(), downstream.ListParams{Prefix: imsi}); err != nil || l.Total != 1 || l.Items[0].IMSI != imsi ||
+		l.Items[0].Status != PolicySuspended {
 		t.Errorf("list = %+v, %v", l, err)
+	}
+
+	// 再開。値は前後の空白を除き小文字にして受け付ける。
+	statusCtx, resumeTrace := integrationCtx(t)
+	if resp := setStatus(statusCtx, `{"status":" Active "}`); resp.Status != http.StatusOK || !strings.Contains(string(resp.Body), `"status":"active"`) {
+		t.Errorf("resume: %+v (%s)", resp, resp.Body)
+	}
+	downstreamtest.CheckAudit(t, c.Client, resumeTrace, "policy.resume", imsi)
+	// 同じ状態への変更も 200。
+	if resp := setStatus(statusCtx, `{"status":"active"}`); resp.Status != http.StatusOK {
+		t.Errorf("same status: %+v (%s)", resp, resp.Body)
 	}
 
 	// ルールの誤りは位置つきで返る。
@@ -161,6 +196,10 @@ func TestIntegrationPolicies(t *testing.T) {
 	_, err = c.GetPolicy(t.Context(), imsi)
 	wantCause(t, err, http.StatusNotFound, CausePolicyNotFound)
 	wantCause(t, c.DeletePolicy(ctx, imsi), http.StatusNotFound, CausePolicyNotFound)
+	// 認可ポリシーがなければ停止できない。
+	if resp := setStatus(statusCtx, `{"status":"suspended"}`); resp.Status != http.StatusNotFound || !strings.Contains(string(resp.Body), CausePolicyNotFound) {
+		t.Errorf("suspend without policy: %+v (%s)", resp, resp.Body)
+	}
 }
 
 // TestIntegrationRelay は、provisioner が中継する操作（RADIUSクライアント、セッション、監査ログ）を Relay で確かめる。

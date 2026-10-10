@@ -34,7 +34,7 @@ provisioner は、本PoCの Provisioning API（provisioning-api。以下「prov�
 
 1 つの provisioner が扱うのは、本PoCの 1 ノードと aka-only-server の 1 台である。下流の版は次を使う。
 
-- 本PoCの provisioning-api 0.3.0 以降（本PoCの main の def95e5 以降）。
+- 本PoCの provisioning-api 0.4.0 以降（本PoCの main の dbd97f5 以降）。0.3.0（def95e5 以降）でも動くが、加入者の停止・再開（2.10）が使えず、加入者の `status` も出ない。
 - aka-only-server の管理API 0.2.0 以降（aka-only-server の main の 2a6dcf8 以降）。それより前の版では、aka の監査ログにトレースID が残らない。
 
 ### 1.1 証明書
@@ -295,7 +295,7 @@ docker compose logs eapaka-provisioner
 
 ```
 {"level":"INFO","msg":"plmn map","entries":"44020=aka"}
-{"level":"INFO","msg":"provisioning-api is available","server_version":"0.3.0","node_name":"simwifi"}
+{"level":"INFO","msg":"provisioning-api is available","server_version":"0.4.0","node_name":"simwifi"}
 {"level":"INFO","msg":"aka-only-server is available","server_version":"dev"}
 {"level":"INFO","msg":"av client of vector-gateway","av_client_id":1,"name":"vector-gateway"}
 {"level":"INFO","msg":"listening","addr":"[::]:9446"}
@@ -312,7 +312,7 @@ docker compose exec -T eapaka-provisioner /eapaka-provisioner check-downstream
 PLMN マップ: 44020=aka
 
 本PoCの Provisioning API: https://provisioning-api:9444/admin/v1
-  接続できました。provisioning-api 0.3.0（ノード simwifi、加入者 0、RADIUSクライアント 0、認可ポリシー 0）
+  接続できました。provisioning-api 0.4.0（ノード simwifi、加入者 0、RADIUSクライアント 0、認可ポリシー 0）
 
 aka-only-server の管理API: https://aka-only-server:9443/admin/v1
   接続できました。aka-only-server dev（加入者 0、AVクライアント 1）
@@ -381,7 +381,7 @@ docker run --rm --network eapaka-provisioner --user "$(id -u):$(id -g)" -v "$PWD
 ```
 
 ```json
-{"version":"dev","startedAt":"...","plmnMap":[{"plmn":"44020","keyStore":"aka"}],"downstreams":{"prov":{"configured":true,"url":"https://provisioning-api:9444/admin/v1","reachable":true,"version":"0.3.0","nodeName":"simwifi","subscriberCount":0},"aka":{"configured":true,"url":"https://aka-only-server:9443/admin/v1","reachable":true,"version":"dev","subscriberCount":0}},"avClient":{"id":1,"exists":true,"enabled":true,"name":"vector-gateway"},"valkey":{"reachable":true},"operations":{"running":0,"retrying":0,"failed":0}}
+{"version":"dev","startedAt":"...","plmnMap":[{"plmn":"44020","keyStore":"aka"}],"downstreams":{"prov":{"configured":true,"url":"https://provisioning-api:9444/admin/v1","reachable":true,"version":"0.4.0","nodeName":"simwifi","subscriberCount":0},"aka":{"configured":true,"url":"https://aka-only-server:9443/admin/v1","reachable":true,"version":"dev","subscriberCount":0}},"avClient":{"id":1,"exists":true,"enabled":true,"name":"vector-gateway"},"valkey":{"reachable":true},"operations":{"running":0,"retrying":0,"failed":0}}
 ```
 
 確認が終わったら、管理クライアントの秘密鍵を含む確認用のディレクトリを消す。
@@ -407,7 +407,7 @@ pv POST /subscribers -d '{"imsi":"440100123456789","ki":"<Ki>","opc":"<OPc>","po
 ```
 
 ```json
-{"imsi":"440100123456789","keyStore":"poc","key":{"amf":"8000","sqn":"000000000000","createdAt":"..."},"policy":{"default":"allow","rules":[]},"issues":[]}
+{"imsi":"440100123456789","keyStore":"poc","key":{"amf":"8000","sqn":"000000000000","createdAt":"..."},"policy":{"default":"allow","rules":[]},"status":"active","issues":[]}
 ```
 
 ```bash
@@ -415,10 +415,37 @@ pv POST /subscribers -d '{"imsi":"440200123456789","ki":"<Ki>","opc":"<OPc>","po
 ```
 
 ```json
-{"imsi":"440200123456789","keyStore":"aka","key":{"amf":"8000","sqn":"000000000000","sqnType":"inc32","allowPlain":false,"allowedClientIds":[1],"createdAt":"...","updatedAt":"..."},"policy":{"default":"allow","rules":[]},"issues":[]}
+{"imsi":"440200123456789","keyStore":"aka","key":{"amf":"8000","sqn":"000000000000","sqnType":"inc32","allowPlain":false,"allowedClientIds":[1],"createdAt":"...","updatedAt":"..."},"policy":{"default":"allow","rules":[]},"status":"active","issues":[]}
 ```
 
 `keyStore` が `aka` の加入者は、`allowedClientIds` に vector-gateway の AVクライアントID が入る。検証では、この 2 人を eapaka_test で認証し、どちらも Access-Accept になること、ポリシーを `deny` に変えると Access-Reject になること、削除すると Access-Reject になることを確かめた（2026-10-10）。
+
+### 2.10 加入者を停止・再開する
+
+加入者を登録したまま、一時的に認証できなくする（停止）、または戻す（再開）。停止の印は本PoCの認可ポリシーの状態（`status`）で、鍵の置き場所によらず本PoCの auth-server が認証を拒否する（本PoCの provisioning-api 0.4.0 以降。1 章）。2.9 の関数 `pv` で次のように行う。
+
+```bash
+pv PUT /policies/440200123456789/status -d '{"status":"suspended"}'
+```
+
+```json
+{"imsi":"440200123456789","default":"allow","rules":[],"status":"suspended"}
+```
+
+再開は `{"status":"active"}` を送る。加入者の取得・一覧でも `status` で状態が分かる。
+
+```bash
+pv PUT /policies/440200123456789/status -d '{"status":"active"}'
+```
+
+- 効くのは次の認証からで、接続中のセッションは切れない（セッションの切断は扱わない）。停止中の認証は Access-Reject になり、本PoCの auth-server のログに `AUTH_SUBSCRIBER_SUSPENDED`（WARN）が出る。
+- 認可ポリシーがない加入者は停止できない（404 `POLICY_NOT_FOUND`。認可ポリシーがなければ、もともと認証は拒否される）。`active` / `suspended` 以外の値は 400。どちらも本PoCの応答をそのまま返す。
+- 認可ポリシーの置き換え（`PATCH /subscribers/{imsi}` の `policy`、`PUT /policies/{imsi}`）では状態は変わらない（停止中なら停止のまま）。加入者の作成では指定できず、常に `active` で作る。
+- 認可ポリシーを削除すると停止の印も消える（作り直すと `active`）。
+- 加入者の操作と同じく、同じ IMSI の操作が処理中なら 409（`OPERATION_IN_PROGRESS`）、未完了の操作があれば 409（`OPERATION_UNRESOLVED`。6.3）になる。`Idempotency-Key` も付けられる。
+- 監査ログには `policy.suspend` / `policy.resume` で残る（7 章）。今と同じ状態への変更も 200 で、provisioner の監査ログには残る（本PoCの監査ログには残らない）。
+
+検証では、2.9 の 2 人を停止すると eapaka_test でどちらも Access-Reject になること、停止中に `policy` を置き換えても停止のままであること、再開すると Access-Accept に戻ることを確かめた（2026-10-10）。
 
 ## 3. 別ホストで動かす場合
 
@@ -627,7 +654,7 @@ pv POST /operations/<operationId>/dismiss
 
 - `retry` と `dismiss` は、監査ログに `operation.retry` / `operation.dismiss` として、要求した操作者と管理クライアントつきで残る。
 - `dismiss` は下流に何もしない。下流を手で直した後に使う。
-- 未完了（`running` / `retrying` / `failed`）の操作がある IMSI には、加入者の作成・変更・削除と、認可ポリシーの PUT・DELETE ができない（409 `OPERATION_UNRESOLVED`。応答の `operationId` がその操作）。古い操作の続き（補償・やり直し）が、新しい操作の結果を消さないようにするためである（例: 作成の補償が残ったまま同じ IMSI を作り直すと、作り直した加入者が補償で消される）。その操作を `retry` で終わらせるか、下流を手で直して `dismiss` で閉じてから、送り直す。同じ `Idempotency-Key` で送り直してよい（この 409 は覚えない）。
+- 未完了（`running` / `retrying` / `failed`）の操作がある IMSI には、加入者の作成・変更・削除と、認可ポリシーの PUT・DELETE・停止・再開ができない（409 `OPERATION_UNRESOLVED`。応答の `operationId` がその操作）。古い操作の続き（補償・やり直し）が、新しい操作の結果を消さないようにするためである（例: 作成の補償が残ったまま同じ IMSI を作り直すと、作り直した加入者が補償で消される）。その操作を `retry` で終わらせるか、下流を手で直して `dismiss` で閉じてから、送り直す。同じ `Idempotency-Key` で送り直してよい（この 409 は覚えない）。
 
   ```json
   {"title":"Conflict","status":409,"detail":"an unresolved operation (retrying) remains on the same IMSI; retry or dismiss it first: /operations/01a12300-...-000000000012","cause":"OPERATION_UNRESOLVED","operationId":"01a12300-...-000000000012"}
@@ -649,6 +676,7 @@ docker compose logs -f eapaka-provisioner
 - provisioner は、操作ごとのトレースID（要求の `X-Trace-ID`。なければ採番）を下流 2 つにも渡す。provisioner の監査ログの `traceId` は、下流の監査ログの `traceId` と同じになる。補償・やり直しも、元の操作のトレースID を渡す。
 - provisioner の監査ログの加入者の操作には、操作の記録の ID（`operationId`）と、手順ごとの結果（`details.steps`）が入る。
 - 中継した操作（RADIUSクライアント、認可ポリシー）の監査ログには、変えた項目の名前だけを残す（値は下流の監査ログにある）。
+- 加入者の停止・再開（2.10）は `policy.suspend` / `policy.resume` で残る。どちらになるかは、本PoCの応答（変更後の状態）で決まる。
 - Ki、OPc、共有シークレットは、provisioner のログにも監査ログにも出ない。
 - 監査ログは `PROVISIONER_AUDIT_MAX` 件を超えると古いものから消える。長く残したい場合は、Docker のログを外部に保存する。
 - Docker のログは既定では無制限に増える。`/etc/docker/daemon.json` などでローテーションを設定しておく。

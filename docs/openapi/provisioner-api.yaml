@@ -1,11 +1,16 @@
 openapi: 3.0.3
 info:
   title: eapaka-node-provisioner API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     EAP-AKA RADIUS PoC（以下「本PoC」）の Provisioning API（以下「prov」）と、aka-only-server の管理API（以下「aka」）を
     組み合わせて操作する統合API。設計は `docs/design-overview.md` を参照。
-    作法は下流の 2 つの API（prov 0.3.0、aka 0.2.0）に揃えている。
+    作法は下流の 2 つの API（prov 0.4.0、aka 0.2.0）に揃えている。
+
+    0.3.0 の変更:
+    - 加入者の停止・再開（`PUT /policies/{imsi}/status`。prov の中継）を加えた。停止の印は本PoCの認可ポリシーの状態
+      （`status`: `active` / `suspended`）で、鍵の置き場所によらず本PoCの Auth Server が認証を拒否する。
+    - 加入者の統合リソースに `status`（認可ポリシーの状態）を加えた。作成・変更の本文では指定できない（作成は常に `active`）。
 
     加入者:
     - 加入者を「IMSI＋鍵の置き場所（`keyStore`）＋認可ポリシー」として扱う（`/subscribers`）。
@@ -40,10 +45,10 @@ info:
     - 最初の要求が処理中なら 409（`OPERATION_IN_PROGRESS`）、同じキーで内容（メソッド・パス・本文）が違えば 422（`IDEMPOTENCY_KEY_MISMATCH`）。
 
     排他:
-    - 加入者の作成・変更・削除と、認可ポリシーの PUT・DELETE は、IMSI ごとに排他する。同じ IMSI の操作が処理中なら、
+    - 加入者の作成・変更・削除と、認可ポリシーの PUT・DELETE・停止・再開は、IMSI ごとに排他する。同じ IMSI の操作が処理中なら、
       待たずに 409（`OPERATION_IN_PROGRESS`）を返す。
     - 同じ IMSI に未完了（`running` / `retrying` / `failed`）の操作の記録があれば、加入者の作成・変更・削除と、
-      認可ポリシーの PUT・DELETE を 409（`OPERATION_UNRESOLVED`。`operationId` 付き）で断る。古い操作の続き（補償・やり直し）が
+      認可ポリシーの PUT・DELETE・停止・再開を 409（`OPERATION_UNRESOLVED`。`operationId` 付き）で断る。古い操作の続き（補償・やり直し）が
       新しい操作の結果を消さないようにするため。その操作を `retry` か `dismiss` で片付けてから送り直す。
     - 排他は provisioner を通る操作どうしでだけ効く。本PoCの Admin TUI、aka 版 GUI、下流の API を直接呼ぶ操作とは排他できない。
 
@@ -730,6 +735,50 @@ paths:
         default:
           $ref: '#/components/responses/Relayed'
 
+  /policies/{imsi}/status:
+    parameters:
+      - $ref: '#/components/parameters/Imsi'
+      - $ref: '#/components/parameters/OperatorId'
+      - $ref: '#/components/parameters/TraceId'
+    put:
+      tags: [policies]
+      summary: 加入者を停止する、または再開する（prov の中継。0.3.0 で追加）
+      operationId: putPolicyStatus
+      description: |
+        prov の `PUT /policies/{imsi}/status` を中継する。`suspended` にすると、本PoCの Auth Server はその加入者の認証を
+        ルールを評価せずに拒否する（鍵の置き場所によらない）。`active` に戻すと再開する。効くのは次の認証からで、
+        接続中のセッションは切れない。
+        - 加入者の操作と同じ IMSI のロックを取る（処理中なら 409 `OPERATION_IN_PROGRESS`）。
+          同じ IMSI に未完了の操作の記録があれば 409（`OPERATION_UNRESOLVED`）。
+        - 本文は検証せずに送る（`status` の検証は prov。前後の空白を除き小文字にしてから検証し、`active` / `suspended`
+          以外は 400）。認可ポリシーがなければ 404（`POLICY_NOT_FOUND`。prov の応答）。
+        - 今と同じ状態への変更も 200。prov はこのとき書き込まず監査ログにも残さないが、provisioner は受け付けた要求として
+          監査ログに残す。
+        - 監査ログの操作は、応答の状態（変更後）が `suspended` なら `policy.suspend`、`active` なら `policy.resume`。
+        - 停止の印は認可ポリシーにあるので、認可ポリシーを削除すると消える（作り直すと `active`）。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyStatusPut'
+            example:
+              status: suspended
+      responses:
+        '200':
+          description: 状態を変えた後の認可ポリシー
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        default:
+          $ref: '#/components/responses/Relayed'
+
   /sessions:
     parameters:
       - $ref: '#/components/parameters/OperatorId'
@@ -1066,7 +1115,7 @@ components:
         中継のエラー。
         - 下流が返したエラー（ProblemDetails）は、ステータスと本文をそのまま返す（`downstream` を加える）。
         - 下流に接続できない場合は 503（`DOWNSTREAM_UNAVAILABLE`）、ProblemDetails でない応答は 502（`DOWNSTREAM_ERROR`）。
-        - `/policies/{imsi}` の PUT / DELETE で同じ IMSI の操作が処理中なら 409（`OPERATION_IN_PROGRESS`）、
+        - `/policies/{imsi}` の PUT / DELETE と `/policies/{imsi}/status` の PUT で同じ IMSI の操作が処理中なら 409（`OPERATION_IN_PROGRESS`）、
           同じ IMSI に未完了の操作の記録があれば 409（`OPERATION_UNRESOLVED`。`operationId` 付き）。
         - `Idempotency-Key` の判定は 409（`OPERATION_IN_PROGRESS`）/ 422（`IDEMPOTENCY_KEY_MISMATCH`）。
         - aka を設定していない場合の `/aka/...` は 404（`DOWNSTREAM_NOT_CONFIGURED`）。
@@ -1218,6 +1267,12 @@ components:
           allOf:
             - $ref: '#/components/schemas/PolicyBody'
           description: 認可ポリシー。ない場合は省略する（`issues` に `POLICY_MISSING`）。
+        status:
+          allOf:
+            - $ref: '#/components/schemas/PolicyStatus'
+          description: |
+            加入者の状態（認可ポリシーの `status`。0.3.0 で追加）。認可ポリシーがない場合は省略する。
+            変更は `PUT /policies/{imsi}/status` で行う。
         issues:
           type: array
           description: 食い違い。正常なら空の配列。
@@ -1237,6 +1292,7 @@ components:
         policy:
           default: allow
           rules: []
+        status: active
         issues: []
 
     SubscriberCreate:
@@ -1273,7 +1329,9 @@ components:
           type: boolean
           description: '`aka` のときだけ指定できる。省略時は `false`。'
         policy:
-          $ref: '#/components/schemas/PolicyBody'
+          allOf:
+            - $ref: '#/components/schemas/PolicyBody'
+          description: 認可ポリシー。状態（`status`）は指定できず、常に `active` で作る。
 
     SubscriberUpdate:
       type: object
@@ -1298,7 +1356,9 @@ components:
         policy:
           allOf:
             - $ref: '#/components/schemas/PolicyBody'
-          description: 認可ポリシー全体を置き換える（ない場合は作成する）。削除は `DELETE /policies/{imsi}` で行う。
+          description: |
+            認可ポリシー全体を置き換える（ない場合は作成する）。削除は `DELETE /policies/{imsi}` で行う。
+            状態（`status`）は指定できず、置き換えても変わらない（停止中なら停止のまま）。
 
     SubscriberKeys:
       type: object
@@ -1615,7 +1675,8 @@ components:
           description: |
             操作。
             - 加入者: `subscriber.create` / `subscriber.update` / `subscriber.delete` / `subscriber.keys.read`
-            - 中継: `client.create` / `client.update` / `client.delete` / `client.secret.read`、`policy.create` / `policy.update` / `policy.delete`
+            - 中継: `client.create` / `client.update` / `client.delete` / `client.secret.read`、`policy.create` / `policy.update` / `policy.delete`、
+              `policy.suspend` / `policy.resume`（停止・再開。応答の状態が読めなければ `policy.status.update`）
             - 操作の記録: `operation.resume`（自動のやり直しの結果）、`operation.retry`、`operation.dismiss`
           example: subscriber.create
         target:
@@ -1658,7 +1719,7 @@ components:
           type: string
           description: さらに古いエントリがある場合だけ返す。
 
-    # ---- 以下は prov（Provisioning API 0.3.0）と同じ形 ----
+    # ---- 以下は prov（Provisioning API 0.4.0）と同じ形 ----
 
     Ipv4:
       type: string
@@ -1793,6 +1854,7 @@ components:
         - imsi
         - default
         - rules
+        - status
       properties:
         imsi:
           $ref: '#/components/schemas/Imsi'
@@ -1802,6 +1864,26 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PolicyRule'
+        status:
+          $ref: '#/components/schemas/PolicyStatus'
+
+    PolicyStatus:
+      type: string
+      description: |
+        加入者の状態（prov 0.4.0 から）。`active` は利用中、`suspended` は停止中（本PoCの Auth Server が認証を拒否する）。
+        prov は Valkey にフィールドがなければ `active` を返し、Valkey を直接書き換えた不正な値はそのまま返す
+        （Auth Server は拒否する。`PUT /policies/{imsi}/status` で正しい値に戻せる）。provisioner も値をそのまま返す。
+      enum:
+        - active
+        - suspended
+
+    PolicyStatusPut:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: '#/components/schemas/PolicyStatus'
 
     PolicyPut:
       type: object

@@ -101,21 +101,30 @@ func TestRelayPathValues(t *testing.T) {
 	if n := e.prov.calls(); n != 0 {
 		t.Errorf("relayed %d requests", n)
 	}
+	if p := decode[problem](t, e.doBody("PUT", "/admin/v1/policies/12345/status", nil, `{"status":"active"}`), 400); p.Cause != "MANDATORY_IE_INCORRECT" {
+		t.Errorf("status: %+v", p)
+	}
 
 	// 正しい値はそのまま下流のパスになる。
 	e.do("GET", "/admin/v1/clients/12/secret", nil)
 	e.do("GET", "/admin/v1/policies/001010000000001", nil)
-	if got := [][]string{e.prov.requests[0].Path, e.prov.requests[1].Path}; !slices.Equal(got[0], []string{"clients", "12", "secret"}) ||
-		!slices.Equal(got[1], []string{"policies", "001010000000001"}) {
+	e.doBody("PUT", "/admin/v1/policies/001010000000001/status", nil, `{"status":"suspended"}`)
+	if got := [][]string{e.prov.requests[0].Path, e.prov.requests[1].Path, e.prov.requests[2].Path}; !slices.Equal(got[0], []string{"clients", "12", "secret"}) ||
+		!slices.Equal(got[1], []string{"policies", "001010000000001"}) || !slices.Equal(got[2], []string{"policies", "001010000000001", "status"}) {
 		t.Errorf("paths = %v", got)
+	}
+	// 本文は検証せずにそのまま送る。
+	if r := e.prov.requests[2]; r.Method != "PUT" || string(r.Body) != `{"status":"suspended"}` {
+		t.Errorf("status request = %+v", r)
 	}
 }
 
 func TestRelayAudit(t *testing.T) {
 	e := newEnv(t, false)
 	status := 200
+	respBody := `{}`
 	e.prov.relay = func(downstream.RelayRequest) (downstream.RelayResponse, error) {
-		return downstream.RelayResponse{Status: status, ContentType: "application/json", Body: []byte(`{}`)}, nil
+		return downstream.RelayResponse{Status: status, ContentType: "application/json", Body: []byte(respBody)}, nil
 	}
 	e.do("GET", "/admin/v1/clients/5/secret", nil)
 	e.doBody("PATCH", "/admin/v1/clients/5", nil, `{"secret":"new","name":"ap-2"}`)
@@ -127,6 +136,18 @@ func TestRelayAudit(t *testing.T) {
 	e.doBody("PUT", "/admin/v1/policies/001010000000001", nil, `{"default":"allow","rules":[]}`)
 	status = 204
 	e.do("DELETE", "/admin/v1/policies/001010000000001", nil)
+	// 停止・再開は、応答の状態（変更後）で分ける。同じ状態への変更も残す。
+	status = 200
+	respBody = `{"imsi":"001010000000001","default":"deny","rules":[],"status":"suspended"}`
+	e.doBody("PUT", "/admin/v1/policies/001010000000001/status", nil, `{"status":"suspended"}`)
+	e.doBody("PUT", "/admin/v1/policies/001010000000001/status", nil, `{"status":"suspended"}`)
+	respBody = `{"imsi":"001010000000001","default":"deny","rules":[],"status":"active"}`
+	e.doBody("PUT", "/admin/v1/policies/001010000000001/status", nil, `{"status":" Active "}`)
+	respBody = `{}`
+	e.doBody("PUT", "/admin/v1/policies/001010000000001/status", nil, `{"status":"active"}`)
+	// 断られた要求は残さない。
+	status = 404
+	e.doBody("PUT", "/admin/v1/policies/001010000000002/status", nil, `{"status":"suspended"}`)
 	// 読み取り（秘密の値以外）は残さない。
 	status = 200
 	e.do("GET", "/admin/v1/clients", nil)
@@ -144,6 +165,10 @@ func TestRelayAudit(t *testing.T) {
 		`policy.create 001010000000001 {"downstream":"prov"}`,
 		`policy.update 001010000000001 {"downstream":"prov"}`,
 		`policy.delete 001010000000001 {"downstream":"prov"}`,
+		`policy.suspend 001010000000001 {"downstream":"prov"}`,
+		`policy.suspend 001010000000001 {"downstream":"prov"}`,
+		`policy.resume 001010000000001 {"downstream":"prov"}`,
+		`policy.status.update 001010000000001 {"downstream":"prov"}`,
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("audits =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -177,6 +202,9 @@ func TestRelayPolicyLock(t *testing.T) {
 	// 同じ IMSI の書き込みは 409。読み取りと別の IMSI は通る。
 	if p := decode[problem](t, e.do("DELETE", "/admin/v1/policies/001010000000001", nil), 409); p.Cause != "OPERATION_IN_PROGRESS" {
 		t.Errorf("same imsi = %+v", p)
+	}
+	if p := decode[problem](t, e.doBody("PUT", "/admin/v1/policies/001010000000001/status", nil, `{"status":"suspended"}`), 409); p.Cause != "OPERATION_IN_PROGRESS" {
+		t.Errorf("same imsi (status) = %+v", p)
 	}
 	if w := e.do("GET", "/admin/v1/policies/001010000000001", nil); w.Code != 200 {
 		t.Errorf("read = %d", w.Code)

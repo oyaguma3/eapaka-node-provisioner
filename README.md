@@ -19,6 +19,7 @@
 - 同じ IMSI の操作は IMSI ごとのロックで排他し、`Idempotency-Key` で再送を判定します。未完了の操作が残っている IMSI への新しい操作は、片付けるまで断ります（古い操作の補償が新しい操作の結果を消さないように）。
 - 取得では、2 つのノードの食い違い（鍵がない、ポリシーがない、置き場所でない方にも鍵がある等）を `issues` で示します。
 - RADIUSクライアント、認可ポリシー、セッション、下流の監査ログは、本PoCの Provisioning API と同じ形で中継します（BFF が呼び先を付け替えやすいように）。
+- 加入者を登録したまま停止・再開できます（本PoCの認可ポリシーの状態 `status`。鍵の置き場所によらず本PoCが認証を拒否します）。
 - 操作者（`X-Operator-Id`）とトレースID（`X-Trace-ID`）を下流 2 つに渡すので、provisioner と下流の監査ログを突き合わせられます。
 - 加入者のデータは保存しません（正本は下流）。専用の Valkey に持つのは、操作の記録、ロック、`Idempotency-Key`、監査ログだけです。Ki / OPc と共有シークレットは保存せず、ログにも出しません。
 
@@ -27,7 +28,7 @@
 | `/status` | 下流 2 つへの接続、PLMN マップ、vector-gateway の AVクライアント、未完了の操作の件数 |
 | `/subscribers` | 加入者の統合操作（一覧、作成、取得、変更、削除、Ki / OPc の取得） |
 | `/operations` | 操作の記録の確認と、やり直し（`retry`）・閉じる（`dismiss`） |
-| `/clients`、`/policies`、`/sessions` | 本PoCの RADIUSクライアント・認可ポリシー・セッションの中継 |
+| `/clients`、`/policies`、`/sessions` | 本PoCの RADIUSクライアント・認可ポリシー（加入者の停止・再開 `/policies/{imsi}/status` を含む）・セッションの中継 |
 | `/audit-logs`、`/prov/audit-logs`、`/aka/audit-logs` | provisioner と下流 2 つの監査ログ |
 | `/aka/av-clients/{clientId}` | vector-gateway の AVクライアントの参照 |
 
@@ -35,7 +36,7 @@
 
 ## 導入
 
-Docker Engine と compose プラグインが必要です。本PoC（provisioning-api 0.3.0 以降）と aka-only-server（管理API 0.2.0 以降）を導入しておき、provisioner を両方の管理クライアントとして登録します。手順は[運用ガイド](docs/operation-guide.md)の 2 章（同一ホスト）と 3 章（別ホスト）にあります。
+Docker Engine と compose プラグインが必要です。本PoC（provisioning-api 0.4.0 以降。0.3.0 では加入者の停止・再開が使えません）と aka-only-server（管理API 0.2.0 以降）を導入しておき、provisioner を両方の管理クライアントとして登録します。手順は[運用ガイド](docs/operation-guide.md)の 2 章（同一ホスト）と 3 章（別ホスト）にあります。
 
 流れは次の通りです。
 

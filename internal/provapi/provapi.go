@@ -174,7 +174,16 @@ type Policy struct {
 	IMSI    string       `json:"imsi"`
 	Default string       `json:"default"`
 	Rules   []PolicyRule `json:"rules"`
+	// Status は加入者の状態（provisioning-api 0.4.0 から）。active（利用中）か suspended（停止中）。
+	// 認可ポリシーの PUT では変わらない。変更は PUT /policies/{imsi}/status（provisioner は中継するだけ）。
+	Status string `json:"status,omitempty"`
 }
+
+// 加入者の状態（Policy.Status）。
+const (
+	PolicyActive    = "active"
+	PolicySuspended = "suspended"
+)
 
 // PolicyPut は認可ポリシーの内容（全体を置き換える）。
 type PolicyPut struct {

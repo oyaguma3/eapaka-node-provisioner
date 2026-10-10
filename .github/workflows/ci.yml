@@ -84,7 +84,7 @@ jobs:
     timeout-minutes: 20
     env:
       # 契約テストの相手にする下流のコミット。下流の API を変えたら、その main に入った後のコミットに更新する。
-      POC_REF: def95e59143c27ca011b81e3ed90f8edcc0762a6
+      POC_REF: dbd97f54df2200d18bc0ec977e73d6c86289baf4
       AKA_REF: 2a6dcf84c82313e5e1b67035ad17083c2ec868c2
     services:
       # 下流がそれぞれ使う Valkey（このジョブ専用で、テストデータは最後に消える）。

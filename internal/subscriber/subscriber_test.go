@@ -21,10 +21,10 @@ func TestGet(t *testing.T) {
 	}
 
 	e.prov.subs[pocIMSI] = provapi.Subscriber{IMSI: pocIMSI, AMF: "8000", SQN: "000000000020"}
-	e.prov.policies[pocIMSI] = provapi.Policy{IMSI: pocIMSI, Default: "deny", Rules: policy.Rules}
+	e.prov.policies[pocIMSI] = provapi.Policy{IMSI: pocIMSI, Default: "deny", Rules: policy.Rules, Status: provapi.PolicySuspended}
 	sub, err := e.s.Get(ctx, pocIMSI)
 	if err != nil || sub.KeyStore != plmn.KeyStorePoC || sub.Key == nil || sub.Key.SQN != "000000000020" || sub.Key.AllowPlain != nil ||
-		sub.Policy == nil || sub.Policy.Default != "deny" || len(sub.Issues) != 0 {
+		sub.Policy == nil || sub.Policy.Default != "deny" || sub.Status != provapi.PolicySuspended || len(sub.Issues) != 0 {
 		t.Errorf("poc = %+v, %v", sub, err)
 	}
 
@@ -68,6 +68,12 @@ func TestGet(t *testing.T) {
 	e.prov.policies[akaIMSI] = provapi.Policy{IMSI: akaIMSI, Default: "allow"}
 	if sub, err := e.s.Get(ctx, akaIMSI); err != nil || issues(sub) != "[KEY_MISSING]" {
 		t.Errorf("policy only = %+v, %v", sub, err)
+	}
+	// ポリシーがなければ状態もない。
+	delete(e.prov.policies, akaIMSI)
+	e.aka.subs[akaIMSI] = akaapi.Subscriber{IMSI: akaIMSI, AllowedClientIDs: []int64{1}}
+	if sub, err := e.s.Get(ctx, akaIMSI); err != nil || sub.Status != "" || issues(sub) != "[POLICY_MISSING]" {
+		t.Errorf("no policy = %+v, %v", sub, err)
 	}
 }
 
@@ -307,6 +313,25 @@ func TestUpdate(t *testing.T) {
 	}
 	if got := e.prov.policies[pocIMSI]; got.Default != "allow" {
 		t.Errorf("policy = %+v", got)
+	}
+
+	// 停止中の加入者: 変更でも補償でも停止は解けない（ポリシーの PUT は状態を変えないため、変更前のポリシーは
+	// 状態を含めずに覚える）。
+	e = setup(t)
+	e.prov.policies[pocIMSI] = provapi.Policy{IMSI: pocIMSI, Default: "allow", Rules: []provapi.PolicyRule{}, Status: provapi.PolicySuspended}
+	if sub, _, err := e.s.Update(ctx, actor, pocIMSI, UpdateInput{Policy: &policy}); err != nil || sub.Status != provapi.PolicySuspended {
+		t.Errorf("suspended update = %+v, %v", sub, err)
+	}
+	e.prov.plan("prov.UpdateSubscriber", fault{err: errUnavailable})
+	_, res, err = e.s.Update(ctx, actor, pocIMSI, UpdateInput{AMF: &amf, Policy: &provapi.PolicyPut{Default: "allow", Rules: []provapi.PolicyRule{}}})
+	if oe, ok := errors.AsType[*OperationError](err); !ok || !oe.RolledBack {
+		t.Fatalf("suspended err = %v", err)
+	}
+	if op := e.st.op(res.OperationID); op.PrevPolicy != `{"default":"deny","rules":[{"nasId":"*","allowedSsids":["CORP"]}]}` {
+		t.Errorf("prev policy = %s", op.PrevPolicy)
+	}
+	if got := e.prov.policies[pocIMSI]; got.Default != "deny" || got.Status != provapi.PolicySuspended {
+		t.Errorf("suspended policy after rollback = %+v", got)
 	}
 
 	// 変更前にポリシーがなかったなら、戻すときは消す。

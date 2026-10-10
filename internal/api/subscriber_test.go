@@ -98,13 +98,13 @@ func TestCreateSubscriber(t *testing.T) {
 	e.subs.res = completedRes
 	e.subs.sub = subscriber.Subscriber{IMSI: "001010000000001", KeyStore: plmn.KeyStorePoC,
 		Key:    &subscriber.Key{AMF: "b9b9", SQN: "000000000000"},
-		Policy: &provapi.PolicyPut{Default: "deny"}, Issues: []subscriber.Issue{}}
+		Policy: &provapi.PolicyPut{Default: "deny"}, Status: "active", Issues: []subscriber.Issue{}}
 	w := e.doBody("POST", "/admin/v1/subscribers", jsonHeader, validCreate)
 	if w.Code != 201 || w.Header().Get("Location") != "/admin/v1/subscribers/001010000000001" {
 		t.Fatalf("response = %d %s", w.Code, w.Body)
 	}
-	// 応答: aka だけの項目は出さない。ポリシーの rules は空でも配列。
-	if got := w.Body.String(); got != `{"imsi":"001010000000001","keyStore":"poc","key":{"amf":"b9b9","sqn":"000000000000"},"policy":{"default":"deny","rules":[]},"issues":[]}` {
+	// 応答: aka だけの項目は出さない。ポリシーの rules は空でも配列。状態はポリシーの外に出す。
+	if got := w.Body.String(); got != `{"imsi":"001010000000001","keyStore":"poc","key":{"amf":"b9b9","sqn":"000000000000"},"policy":{"default":"deny","rules":[]},"status":"active","issues":[]}` {
 		t.Errorf("body = %s", got)
 	}
 	// 入力は本PoCと同じく正規化して渡す（default は小文字、nasId と SSID は前後の空白を除く）。
@@ -163,8 +163,13 @@ func TestCreateSubscriberValidation(t *testing.T) {
 			"sqnType":"inc32","allowPlain":false,"policy":{"default":"deny","rules":[]}}`, "", "OPTIONAL_IE_INCORRECT", []string{"sqnType", "allowPlain"}},
 		"key store mismatch": {`{"imsi":"001010000000001","keyStore":"aka","ki":"465b5ce8b199b49faa5f0a2ee238a6bc","opc":"cd63cb71954a9f4e48a5994e37a02baf",
 			"policy":{"default":"deny","rules":[]}}`, "", "KEY_STORE_MISMATCH", []string{"keyStore"}},
-		"unknown field":       {`{"imsi":"001010000000001","extra":1}`, "", "INVALID_MSG_FORMAT", nil},
-		"unknown rule field":  {`{"policy":{"default":"deny","rules":[{"nasId":"*","allowedSsids":["a"],"x":1}]}}`, "", "INVALID_MSG_FORMAT", nil},
+		"unknown field":      {`{"imsi":"001010000000001","extra":1}`, "", "INVALID_MSG_FORMAT", nil},
+		"unknown rule field": {`{"policy":{"default":"deny","rules":[{"nasId":"*","allowedSsids":["a"],"x":1}]}}`, "", "INVALID_MSG_FORMAT", nil},
+		// 状態は作成では指定できない（常に active。変更は PUT /policies/{imsi}/status）。
+		"policy status": {`{"imsi":"001010000000001","ki":"465b5ce8b199b49faa5f0a2ee238a6bc","opc":"cd63cb71954a9f4e48a5994e37a02baf",
+			"policy":{"default":"deny","rules":[],"status":"suspended"}}`, "", "INVALID_MSG_FORMAT", nil},
+		"status": {`{"imsi":"001010000000001","ki":"465b5ce8b199b49faa5f0a2ee238a6bc","opc":"cd63cb71954a9f4e48a5994e37a02baf",
+			"policy":{"default":"deny","rules":[]},"status":"suspended"}`, "", "INVALID_MSG_FORMAT", nil},
 		"wrong type":          {`{"imsi":1}`, "", "INVALID_MSG_FORMAT", nil},
 		"trailing data":       {`{} {}`, "", "INVALID_MSG_FORMAT", nil},
 		"not json":            {`imsi=1`, "", "INVALID_MSG_FORMAT", nil},
@@ -308,6 +313,8 @@ func TestUpdateSubscriber(t *testing.T) {
 		"aka only (poc)": {"001010000000001", `{"sqnType":"inc1"}`, "", "OPTIONAL_IE_INCORRECT", []string{"sqnType"}},
 		"bad sqn type":   {"001020000000001", `{"sqnType":"inc2"}`, "", "OPTIONAL_IE_INCORRECT", []string{"sqnType"}},
 		"policy rules":   {"001020000000001", `{"policy":{"default":"allow"}}`, "", "MANDATORY_IE_MISSING", []string{"policy.rules"}},
+		"policy status":  {"001020000000001", `{"policy":{"default":"allow","rules":[],"status":"active"}}`, "", "INVALID_MSG_FORMAT", nil},
+		"status":         {"001020000000001", `{"status":"suspended"}`, "", "INVALID_MSG_FORMAT", nil},
 		"content type":   {"001020000000001", `{"amf":"8000"}`, "text/plain", "INVALID_MSG_FORMAT", nil},
 		"bad imsi":       {"00102000000000x", `{"amf":"8000"}`, "", "MANDATORY_IE_INCORRECT", []string{"imsi"}},
 	} {
@@ -360,9 +367,9 @@ func TestDeleteAndKeys(t *testing.T) {
 func TestGetAndListSubscribers(t *testing.T) {
 	e := newEnv(t, true)
 	e.subs.sub = subscriber.Subscriber{IMSI: "001020000000001", KeyStore: plmn.KeyStoreAKA,
-		Issues: []subscriber.Issue{subscriber.IssueKeyMissing}, Policy: &provapi.PolicyPut{Default: "deny", Rules: []provapi.PolicyRule{}}}
+		Issues: []subscriber.Issue{subscriber.IssueKeyMissing}, Policy: &provapi.PolicyPut{Default: "deny", Rules: []provapi.PolicyRule{}}, Status: "suspended"}
 	if w := e.do("GET", "/admin/v1/subscribers/001020000000001", nil); w.Code != 200 ||
-		w.Body.String() != `{"imsi":"001020000000001","keyStore":"aka","policy":{"default":"deny","rules":[]},"issues":["KEY_MISSING"]}` {
+		w.Body.String() != `{"imsi":"001020000000001","keyStore":"aka","policy":{"default":"deny","rules":[]},"status":"suspended","issues":["KEY_MISSING"]}` {
 		t.Errorf("get = %d %s", w.Code, w.Body)
 	}
 
@@ -429,13 +436,17 @@ func TestUnresolvedOperation(t *testing.T) {
 		t.Errorf("after resolved = %d %s", w.Code, w.Body)
 	}
 
-	// ポリシーの PUT・DELETE も断り、下流を呼ばない。取得は通る。
+	// ポリシーの PUT・DELETE と停止・再開も断り、下流を呼ばない。取得は通る。
 	e.subs.unresolved = unresolved
 	before := e.prov.calls()
-	for _, method := range []string{"PUT", "DELETE"} {
-		p := decode[problem](t, e.doBody(method, "/admin/v1/policies/001010000000001", jsonHeader, `{"default":"allow","rules":[]}`), 409)
+	for _, c := range []struct{ method, path, body string }{
+		{"PUT", "/admin/v1/policies/001010000000001", `{"default":"allow","rules":[]}`},
+		{"DELETE", "/admin/v1/policies/001010000000001", ""},
+		{"PUT", "/admin/v1/policies/001010000000001/status", `{"status":"suspended"}`},
+	} {
+		p := decode[problem](t, e.doBody(c.method, c.path, jsonHeader, c.body), 409)
 		if p.Cause != "OPERATION_UNRESOLVED" || p.OperationID != unresolved.OperationID {
-			t.Errorf("%s policy = %+v", method, p)
+			t.Errorf("%s %s = %+v", c.method, c.path, p)
 		}
 	}
 	if e.prov.calls() != before {

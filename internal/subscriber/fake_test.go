@@ -191,8 +191,9 @@ func (f *fakeProv) GetPolicy(_ context.Context, imsi string) (v provapi.Policy, 
 
 func (f *fakeProv) PutPolicy(_ context.Context, imsi string, p provapi.PolicyPut) (v provapi.Policy, created bool, err error) {
 	err = f.do("prov.PutPolicy", func() error {
-		_, existed := f.policies[imsi]
-		v, created = provapi.Policy{IMSI: imsi, Default: p.Default, Rules: p.Rules}, !existed
+		// provisioning-api と同じく、置き換えでは状態を変えない（新規は active）。
+		prev, existed := f.policies[imsi]
+		v, created = provapi.Policy{IMSI: imsi, Default: p.Default, Rules: p.Rules, Status: cmp.Or(prev.Status, provapi.PolicyActive)}, !existed
 		f.policies[imsi] = v
 		return nil
 	})
